@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-офис Shorts</title>
+<style>
+:root{--bg:#f4f1ea;--card:#fff;--tx:#1d1d1f;--mut:#6b6b70;--line:#e2ddd1;--acc:#4f46e5;--ok:#16a34a;--no:#dc2626;--wait:#d97706}
+@media (prefers-color-scheme:dark){:root{--bg:#15151a;--card:#1f1f27;--tx:#f0f0f3;--mut:#9a9aa5;--line:#32323d;--acc:#818cf8}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.45 system-ui,sans-serif;padding:16px}
+h1{font-size:20px;margin:0 0 12px}h2{font-size:15px;margin:0 0 10px}
+.office,.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:12px}
+.desk,.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
+.role{font-size:12px;color:var(--mut)}.name{font-weight:600}
+.stage{height:70px;display:flex;align-items:flex-end;justify-content:space-between;border-bottom:3px solid var(--line);margin:8px 0}
+.av{font-size:42px}.mon{font-size:28px}
+.working .av{animation:bob .6s infinite alternate}.waiting .av{animation:sway 1.4s infinite alternate}
+@keyframes bob{to{transform:translateY(-6px)}}@keyframes sway{to{transform:rotate(-8deg)}}
+.st{font-size:13px;font-weight:600}.working .st{color:var(--ok)}.waiting .st{color:var(--wait)}
+.task{font-size:13px;color:var(--mut)}
+.req{border:1px solid var(--wait);border-radius:10px;padding:10px;margin-bottom:8px}
+.req p{margin:4px 0 8px;font-size:13px;color:var(--mut)}video{width:140px;border-radius:8px;display:block;margin-bottom:8px}
+button{font:inherit;border:0;border-radius:8px;padding:7px 14px;cursor:pointer;color:#fff;margin-right:6px}
+.y{background:var(--ok)}.n{background:var(--no)}
+.vid{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);font-size:13px}
+.hit{color:var(--ok);font-weight:600}.log{max-height:240px;overflow:auto;font-size:12.5px;color:var(--mut)}
+.empty{color:var(--mut);font-size:13px}
+label{display:block;font-size:13px;color:var(--mut);margin-bottom:8px}input,select{display:block;width:100%;padding:6px;margin-top:3px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--tx);font:inherit}
+</style>
+</head>
+<body>
+<h1>🏢 AI-офис Shorts</h1>
+<div class="office" id="office"></div>
+<div class="cols">
+ <div class="card"><h2>Нужно ваше решение</h2><div id="reqs"></div></div>
+ <div class="card"><h2>Статистика канала</h2><div id="vids"></div></div>
+ <div class="card"><h2>Журнал</h2><div class="log" id="log"></div></div>
+ <div class="card"><h2>⚙️ Настройки</h2>
+  <label>Ключ Claude API <span id="k"></span><input id="s_key" type="password" placeholder="sk-ant-..."></label>
+  <label>Тема канала<input id="s_niche"></label>
+  <label>Язык сценариев<input id="s_lang"></label>
+  <label>Голос озвучки<input id="s_voice"></label>
+  <label>Доступ к видео<select id="s_privacy"><option value="private">Приватное</option><option value="unlisted">По ссылке</option><option value="public">Публичное</option></select></label>
+  <label>Порог «залетело» (просмотры)<input id="s_hit" type="number"></label>
+  <button class="y" onclick="save()">Сохранить</button>
+  <hr>
+  <label>Файл client_secret.json <span id="c"></span><input type="file" id="s_file" accept=".json"></label>
+  <button class="y" onclick="yt()">Подключить YouTube</button> <span id="t"></span>
+ </div>
+</div>
+<script>
+const A={writer:["Агент 1","Сценарист","🧑‍💻","📝"],editor:["Агент 2","Монтажёр","🎬","🎞️"],analyst:["Агент 3","Аналитик","📊","📈"]};
+const L={idle:"Свободен",working:"Работает",waiting:"Ждёт вас"};
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let sig="";
+async function tick(){
+ try{
+  const d=await (await fetch("/api/state")).json();
+  $("office").innerHTML=Object.keys(A).map(k=>{const a=A[k],s=d.agents[k];
+   return `<div class="desk ${s.s}"><div class="role">${a[0]}</div><div class="name">${a[1]}</div>
+   <div class="stage"><span class="av">${a[2]}</span><span class="mon">${a[3]}</span></div>
+   <div class="st">${L[s.s]}</div><div class="task">${esc(s.t)}</div></div>`}).join("");
+  const rs=JSON.stringify(d.pending);
+  if(rs!==sig){sig=rs;
+   $("reqs").innerHTML=d.pending.length?d.pending.map(r=>`<div class="req"><b>${r.kind==="script_pending"?"Сценарий":"Опубликовать видео?"}: ${esc(r.title)}</b>
+    ${r.kind==="video_pending"?`<video src="/media/${r.id}" controls></video>`:""}<p>${esc(r.text)}</p>
+    <button class="y" onclick="decide(${r.id},true)">Одобрить</button><button class="n" onclick="decide(${r.id},false)">Отклонить</button></div>`).join(""):'<div class="empty">Пока ничего не ждёт одобрения.</div>';}
+  $("vids").innerHTML=d.videos.length?d.videos.map(v=>`<div class="vid"><span>${esc(v.title)}</span><span class="${v.hit?"hit":""}">${v.hit?"🔥 ":""}${v.views}</span></div>`).join(""):'<div class="empty">Опубликованных видео пока нет.</div>';
+  $("log").innerHTML=d.log.map(l=>`<div>${esc(l)}</div>`).join("");
+ }catch(e){}
+}
+async function decide(id,ok){await fetch("/api/decide",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,ok})});sig="";tick()}
+async function loadSet(){const s=await (await fetch("/api/settings")).json();
+ $("s_niche").value=s.niche;$("s_lang").value=s.lang;$("s_voice").value=s.voice;$("s_privacy").value=s.privacy;$("s_hit").value=s.hit_views;
+ $("k").textContent=s.has_key?"✅":"❌";$("c").textContent=s.has_client?"✅":"❌";$("t").textContent=s.has_token?"✅ подключён":"❌ не подключён"}
+async function post(u,b){return (await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})).json()}
+async function save(){await post("/api/settings",{api_key:$("s_key").value,niche:$("s_niche").value,lang:$("s_lang").value,voice:$("s_voice").value,privacy:$("s_privacy").value,hit_views:+$("s_hit").value||1000});$("s_key").value="";loadSet();alert("Сохранено")}
+$("s_file").onchange=async e=>{const f=e.target.files[0];if(!f)return;const r=await post("/api/client_secret",{text:await f.text()});alert(r.ok?"Файл загружен":"Не удалось прочитать файл");loadSet()}
+async function yt(){const r=await post("/api/youtube_auth",{});alert(r.ok?"YouTube подключён":"Ошибка: "+r.error);loadSet()}
+loadSet();tick();setInterval(tick,1500);
+</script>
+</body>
+</html>
