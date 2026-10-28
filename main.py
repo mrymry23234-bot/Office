@@ -20,13 +20,14 @@ else:
 MODEL, MAX_PENDING, STATS_EVERY = "claude-sonnet-5-5", 2, 3600
 SF = Path("settings.json")
 DEFAULTS = {"api_key": "", "niche": "интересные факты", "lang": "русский",
-            "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000}
+            "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000, "pexels_key": "", "pixabay_key": ""}
 
 def apply_settings(s=None):
-    global CFG, KEY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
+    global CFG, KEY, PEXELS, PIXABAY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
     if s is None: s = json.loads(SF.read_text("utf-8")) if SF.exists() else {}
     CFG = {**DEFAULTS, **s}
-    KEY, NICHE, LANG, VOICE = CFG["api_key"], CFG["niche"], CFG["lang"], CFG["voice"]
+    KEY, PEXELS, NICHE, LANG, VOICE = CFG["api_key"], CFG["pexels_key"], CFG["niche"], CFG["lang"], CFG["voice"]
+    PIXABAY = CFG["pixabay_key"]
     PRIVACY, HIT_VIEWS = CFG["privacy"], int(CFG["hit_views"])
 
 apply_settings()
@@ -83,10 +84,13 @@ def gen_script(insights, titles):
     prompt = (f"Ты сценарист YouTube Shorts в нише «{NICHE}». Язык: {LANG}.\n"
               f"Аналитика канала: {insights}\nУже были темы (не повторяй): {titles}\n"
               "Придумай новую тему и напиши сценарий на 25-35 секунд. Первая фраза: сильный хук. "
-              'Ответь только JSON: {"title":"","narration":"цельный текст для озвучки","description":"","tags":[]}')
+              'Ответь только JSON: {"title":"","scenes":[{"text":"1-2 короткие фразы для озвучки","query":"2-3 английских слова для поиска подходящего видео"}],"description":"","tags":[]}. '
+              'Сцен 6-9. query должен конкретно показывать то, о чём говорит фраза.')
     r = Anthropic(api_key=KEY).messages.create(model=MODEL, max_tokens=8000, messages=[{"role": "user", "content": prompt}])
     t = "".join(b.text for b in r.content if b.type == "text")
-    return json.loads(t[t.find("{"): t.rfind("}") + 1])
+    d = json.loads(t[t.find("{"): t.rfind("}") + 1])
+    d["narration"] = " ".join(s["text"] for s in d["scenes"])
+    return d
 
 async def writer_loop():
     while True:
@@ -117,27 +121,72 @@ def make_srt(text, dur):
         out.append(f"{i}\n{ts(t)} --> {ts(e)}\n{p}\n"); t = e
     return "\n".join(out)
 
+def pixabay_clip(query, path):
+    import urllib.parse, urllib.request
+    ua = {"User-Agent": "Mozilla/5.0"}
+    u = "https://pixabay.com/api/videos/?" + urllib.parse.urlencode(
+        {"key": PIXABAY, "q": query, "per_page": 20, "safesearch": "true"})
+    hits = json.load(urllib.request.urlopen(urllib.request.Request(u, headers=ua), timeout=30))["hits"]
+    v = random.choice(hits[:10])["videos"]
+    url = next(v[k]["url"] for k in ("medium", "small", "large", "tiny") if v.get(k, {}).get("url"))
+    Path(path).write_bytes(urllib.request.urlopen(urllib.request.Request(url, headers=ua), timeout=120).read())
+
+def pexels_clip(query, path):
+    import urllib.parse, urllib.request
+    ua = {"User-Agent": "Mozilla/5.0"}
+    u = "https://api.pexels.com/videos/search?" + urllib.parse.urlencode(
+        {"query": query, "orientation": "portrait", "per_page": 8})
+    vids = json.load(urllib.request.urlopen(urllib.request.Request(u, headers={**ua, "Authorization": PEXELS}), timeout=30))["videos"]
+    v = random.choice(vids)
+    f = min((f for f in v["video_files"] if f["file_type"] == "video/mp4" and (f.get("width") or 0) >= 540),
+            key=lambda f: abs(f["width"] - 1080))
+    Path(path).write_bytes(urllib.request.urlopen(urllib.request.Request(f["link"], headers=ua), timeout=120).read())
+
 async def render(i, d):
     import imageio_ffmpeg
     from mutagen.mp3 import MP3
     ff = imageio_ffmpeg.get_ffmpeg_exe()
-    mp3, srt, out = f"videos/{i}.mp3", f"videos/{i}.srt", f"videos/{i}.mp4"
-    await edge_tts.Communicate(d["narration"], VOICE).save(mp3)
-    dur = MP3(mp3).info.length
-    Path(srt).write_text(make_srt(d["narration"], dur), encoding="utf-8")
-    clips = glob.glob("backgrounds/*.mp4")  # необязательно: свои клипы для фона
-    color = random.choice(["0x1e1b4b", "0x064e3b", "0x7c2d12", "0x1e3a8a"])
-    src = (["-stream_loop", "-1", "-i", random.choice(clips)] if clips
-           else ["-f", "lavfi", "-i", f"color=c={color}:s=1080x1920:r=30"])
-    base = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
-    sub = f",subtitles={srt}:force_style='FontSize=20,Alignment=2,MarginV=350,Outline=2'"
-    for vf in (base + sub, base):  # если субтитры не поддерживаются, соберём без них
-        p = await asyncio.create_subprocess_exec(
-            ff, "-y", *src, "-i", mp3, "-t", str(dur + 0.5), "-vf", vf, "-map", "0:v", "-map", "1:a",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        if await p.wait() == 0: return out
-    raise RuntimeError("ffmpeg завершился с ошибкой")
+    mp3, out = f"videos/{i}.mp3", f"videos/{i}.mp4"
+    scenes = d.get("scenes") or [{"text": s, "query": "abstract background"}
+                                 for s in re.split(r"(?<=[.!?])\s+", d["narration"]) if s]
+    await edge_tts.Communicate(" ".join(s["text"] for s in scenes), VOICE).save(mp3)
+    dur, total = MP3(mp3).info.length, sum(len(s["text"]) for s in scenes)
+    base = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,format=yuv420p"
+
+    async def run(*args):
+        p = await asyncio.create_subprocess_exec(ff, "-y", *args, stdout=asyncio.subprocess.DEVNULL,
+                                                 stderr=asyncio.subprocess.DEVNULL)
+        return await p.wait() == 0
+
+    segs, srt, t = [], [], 0.0
+    for n, s in enumerate(scenes):
+        sd = dur * len(s["text"]) / total
+        srt.append(f"{n+1}\n{ts(t)} --> {ts(t+sd)}\n{s['text']}\n"); t += sd
+        seg, clip, ok = f"videos/{i}_{n}.mp4", f"videos/{i}_{n}_src.mp4", False
+        if PIXABAY or PEXELS:
+            try:
+                await asyncio.to_thread(pixabay_clip if PIXABAY else pexels_clip, s["query"], clip)
+                ok = await run("-stream_loop", "-1", "-i", clip, "-t", f"{sd:.2f}", "-vf", base, "-an", "-c:v", "libx264", seg)
+            except Exception as e:
+                log(f"Монтажёр: нет клипа для «{s['query']}», беру фон ({e})")
+        if not ok:
+            color = random.choice(["0x1e1b4b", "0x064e3b", "0x7c2d12", "0x1e3a8a"])
+            ok = await run("-f", "lavfi", "-i", f"color=c={color}:s=1080x1920:r=30", "-t", f"{sd:.2f}",
+                           "-pix_fmt", "yuv420p", "-c:v", "libx264", seg)
+        if not ok: raise RuntimeError("ffmpeg не смог собрать сцену")
+        segs.append(Path(seg).name)
+    Path(f"videos/{i}.srt").write_text("\n".join(srt), encoding="utf-8")
+    lst = f"videos/{i}_list.txt"
+    Path(lst).write_text("".join(f"file '{x}'\n" for x in segs))
+    sub = f"subtitles=videos/{i}.srt:force_style='FontSize=20,Alignment=2,MarginV=350,Outline=2'"
+    for vf in (sub, None):  # если субтитры не поддерживаются, соберём без них
+        args = ["-f", "concat", "-safe", "0", "-i", lst, "-i", mp3] + (["-vf", vf] if vf else []) + [
+            "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out]
+        if await run(*args): break
+    else:
+        raise RuntimeError("ffmpeg завершился с ошибкой")
+    for x in glob.glob(f"videos/{i}_*"): os.remove(x)
+    return out
 
 async def editor_loop():
     while True:
@@ -228,17 +277,21 @@ class Settings(BaseModel):
     lang: str
     voice: str
     privacy: str
+    pexels_key: str = ""
+    pixabay_key: str = ""
     hit_views: int
 
 @app.get("/api/settings")
 def get_settings():
-    return {**{k: v for k, v in CFG.items() if k != "api_key"}, "has_key": bool(KEY),
+    return {**{k: v for k, v in CFG.items() if k not in ("api_key", "pexels_key", "pixabay_key")}, "has_key": bool(KEY), "has_pexels": bool(PEXELS), "has_pixabay": bool(PIXABAY),
             "has_client": os.path.exists("client_secret.json"), "has_token": os.path.exists("token.json")}
 
 @app.post("/api/settings")
 def set_settings(s: Settings):
     new = s.model_dump()
     if not new["api_key"]: new["api_key"] = KEY
+    if not new["pexels_key"]: new["pexels_key"] = PEXELS
+    if not new["pixabay_key"]: new["pixabay_key"] = PIXABAY
     SF.write_text(json.dumps(new, ensure_ascii=False), "utf-8"); apply_settings(new)
     return {"ok": True}
 
