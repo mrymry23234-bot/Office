@@ -1,0 +1,25 @@
+name: Build AI Office
+on: workflow_dispatch
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - shell: bash
+        run: |
+          SEP=":"; [ "$RUNNER_OS" = "Windows" ] && SEP=";"
+          pyinstaller --onefile --name AIOffice --add-data "index.html${SEP}." \
+            --collect-all imageio_ffmpeg --collect-all edge_tts \
+            --collect-data googleapiclient --collect-submodules uvicorn main.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AIOffice-${{ matrix.os }}
+          path: dist/*
+ 
