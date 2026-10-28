@@ -84,8 +84,8 @@ def gen_script(insights, titles):
               f"Аналитика канала: {insights}\nУже были темы (не повторяй): {titles}\n"
               "Придумай новую тему и напиши сценарий на 25-35 секунд. Первая фраза: сильный хук. "
               'Ответь только JSON: {"title":"","narration":"цельный текст для озвучки","description":"","tags":[]}')
-    r = Anthropic(api_key=KEY).messages.create(model=MODEL, max_tokens=1500, messages=[{"role": "user", "content": prompt}])
-    t = r.content[0].text
+    r = Anthropic(api_key=KEY).messages.create(model=MODEL, max_tokens=8000, messages=[{"role": "user", "content": prompt}])
+    t = "".join(b.text for b in r.content if b.type == "text")
     return json.loads(t[t.find("{"): t.rfind("}") + 1])
 
 async def writer_loop():
