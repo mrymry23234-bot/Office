@@ -21,14 +21,13 @@ MODEL, MAX_PENDING, STATS_EVERY = "claude-sonnet-5-5", 2, 3600
 SF = Path("settings.json")
 DEFAULTS = {"api_key": "", "niche": "интересные факты", "lang": "русский",
             "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000,
-            "replicate_key": "", "pixabay_key": ""}
+            "writer_rules": "", "editor_rules": ""}
 
 def apply_settings(s=None):
-    global CFG, KEY, REPLICATE, PIXABAY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
+    global CFG, KEY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
     if s is None: s = json.loads(SF.read_text("utf-8")) if SF.exists() else {}
     CFG = {**DEFAULTS, **s}
     KEY, NICHE, LANG, VOICE = CFG["api_key"], CFG["niche"], CFG["lang"], CFG["voice"]
-    REPLICATE, PIXABAY = CFG["replicate_key"], CFG["pixabay_key"]
     PRIVACY, HIT_VIEWS = CFG["privacy"], int(CFG["hit_views"])
 
 apply_settings()
@@ -84,8 +83,8 @@ def fetch_stats(ids):
 def revise(d, notes):
     prompt = (f"Вот сценарий YouTube Shorts в формате JSON:\n{json.dumps(d, ensure_ascii=False)}\n\n"
               f"Правки владельца канала: {notes}\n\nВнеси правки: можно менять фразы, порядок и число сцен, "
-              "описания картинок (поля image и style, на английском), название и описание. "
-              f"Язык озвучки: {LANG}. Сохрани тот же формат JSON. Ответь только JSON.")
+              "описания кадров и персонажей (поля image, style и characters, на английском), название и описание. "
+              f"Язык озвучки: {LANG}. Сохрани тот же формат JSON. Ответь только JSON." + rules("w") + rules("e"))
     r = Anthropic(api_key=KEY).messages.create(model=MODEL, max_tokens=8000, messages=[{"role": "user", "content": prompt}])
     s = "".join(b.text for b in r.content if b.type == "text")
     nd = json.loads(s[s.find("{"): s.rfind("}") + 1])
@@ -96,8 +95,8 @@ def gen_script(insights, titles):
     prompt = (f"Ты сценарист YouTube Shorts в нише «{NICHE}». Язык: {LANG}.\n"
               f"Аналитика канала: {insights}\nУже были темы (не повторяй): {titles}\n"
               "Придумай новую тему и напиши сценарий на 25-35 секунд. Первая фраза: сильный хук. "
-              'Ответь только JSON: {"title":"","style":"единый визуальный стиль всех картинок, 5-10 английских слов","scenes":[{"text":"1-2 короткие фразы для озвучки","image":"конкретное описание картинки к фразе на английском: кто и что изображено, место, настроение, 15-25 слов","search":"2-3 английских слова для поиска настоящего фото"}],"description":"","tags":[]}. '
-              'Сцен 6-9. Картинка должна точно показывать то, о чём говорит фраза (например, пирамиды, египтяне, пустыня), Если речь об акулах, на картинке акулы; главный предмет фразы всегда в центре кадра. Никаких надписей, цифр и букв на картинке.')
+              'Ответь только JSON: {"title":"","style":"единый стиль плоских иллюстраций: палитра и настроение, 5-10 английских слов","characters":["главные персонажи и предметы видео, по одному на английском, например: pharaoh in gold headdress"],"scenes":[{"text":"1-2 короткие фразы для озвучки","image":"описание кадра на английском: какие персонажи и предметы и что они делают, место, настроение, 15-25 слов"}],"description":"","tags":[]}. '
+              'Сцен 6-9. Картинка должна точно показывать то, о чём говорит фраза (например, пирамиды, египтяне, пустыня), Если речь об акулах, на картинке акулы; главный предмет фразы всегда в центре кадра. Никаких надписей, цифр и букв на картинке. Рисунок будет плоской мультяшной иллюстрацией, поэтому описывай простые узнаваемые предметы.' + rules("w"))
     r = Anthropic(api_key=KEY).messages.create(model=MODEL, max_tokens=8000, messages=[{"role": "user", "content": prompt}])
     t = "".join(b.text for b in r.content if b.type == "text")
     d = json.loads(t[t.find("{"): t.rfind("}") + 1])
@@ -158,65 +157,145 @@ async def tts(text, path, voice=None):
             last = e; await asyncio.sleep(3)
     raise RuntimeError(f"голос {voice} недоступен: {last}")
 
-UA = {"User-Agent": "Mozilla/5.0"}
+FPS = 15
+W, H, U = 1080, 1920, 10.8  # кадр в пикселях; холст художника 100 x 178 условных единиц, 1 единица = 10,8 px
 
-def download(url, path):
-    import urllib.request
-    Path(path).write_bytes(urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=90).read())
+SHAPES_DOC = """Фигуры (поздние рисуются поверх ранних; цвет "#rrggbb" или с прозрачностью "#rrggbbaa", только плоские цвета, без текста и букв):
+{"t":"rect","x":0,"y":0,"w":10,"h":10,"c":"#hex","r":2}  прямоугольник (r: скругление, необязательно)
+{"t":"circle","x":50,"y":50,"r":5,"c":"#hex"}
+{"t":"ellipse","x":50,"y":50,"rx":8,"ry":4,"c":"#hex","rot":0}  rot в градусах, необязательно
+{"t":"poly","p":[[x,y],[x,y],[x,y]],"c":"#hex"}  многоугольник с острыми углами
+{"t":"blob","p":[[x,y],[x,y],...],"c":"#hex"}  замкнутая плавная форма по опорным точкам (тела, головы, облака, холмы)
+{"t":"line","p":[[x,y],[x,y]],"w":1,"c":"#hex"}  линия или ломаная толщиной w"""
 
-def gen_image(prompt, path):  # бесплатный генератор Pollinations
-    import urllib.parse
-    u = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt[:500]) +
-         f"?width=1080&height=1920&model=flux&nologo=true&seed={random.randint(1, 99999)}")
-    last = None
-    for k in range(3):
+CAST_RULES = """Ты арт-директор мультфильма для YouTube Shorts. Создай набор повторно используемых актёров (3-7 штук): главные персонажи и ключевые предметы этого видео (например: фараон, пирамида, верблюд, облако, солнце, пальма). Каждый актёр рисуется ОДИН раз и затем используется во всех сценах, поэтому выглядит везде одинаково.
+Актёр рисуется в собственном квадрате 100x100 (центр 50,50; ноги и основание примерно на y=90, не выходи за пределы квадрата). Актёр состоит из частей (parts), которые двигаются независимо: у персонажа туловище, голова, каждая рука, каждая нога, хвост (у животных); у неподвижного предмета обычно одна часть. Порядок частей = порядок рисования (задние первыми). Не больше 10 частей и 15 фигур в части.
+Формат ответа, ТОЛЬКО JSON: {"assets":[{"id":"pharaoh","parts":[{"name":"body","pivot":[50,50],"anim":{"type":"none"},"shapes":[...]},{"name":"arm_r","pivot":[62,48],"anim":{"type":"swing","amp":30,"speed":0.7,"phase":0},"shapes":[...]}]}]}
+pivot: точка вращения части (плечо, бедро, основание хвоста). anim.type: "none"; "swing" (качание вокруг pivot на ±amp градусов, speed колебаний в секунду, phase от 0 до 1); "sway" (покачивание вбок на amp единиц); "bob" (вверх-вниз на amp единиц); "spin" (непрерывное вращение, speed оборотов в секунду). У персонажей машут руками и шагают ногами (ноги swing в противофазе: phase 0 и 0.5), качается хвост, голова слегка; облака плывут (sway), у солнца вращаются лучи (spin)."""
+
+STAGE_RULES = """Холст: ширина 100, высота 178 условных единиц (вертикальный кадр 9:16), (0,0) в левом верхнем углу, y растёт вниз. Нижние 40 единиц закрывают субтитры: ничего важного туда не ставь.
+Верни ТОЛЬКО JSON: {"bg":["#цвет верха","#цвет низа"],"shapes":[неподвижный фон: небо, земля, холмы, вода, дальние объекты; координаты холста],"actors":[...]}. 10-30 фигур в shapes.
+actors: актёры из cast, рисуются по порядку (дальние первыми). Поля: {"asset":"id из cast","x":50,"y":100,"size":40,"flip":false,"to":[70,100],"bob":{"amp":1.5,"speed":2},"show":[0,1]}
+x,y: где центр актёра в начале сцены; size: ширина актёра в единицах холста; to: где он окажется в конце сцены (если двигается, иначе не указывай); flip: true, если персонаж идёт или смотрит влево; bob: подпрыгивание всего актёра (необязательно); show: доля времени сцены [от, до], когда актёр виден (так предметы появляются и исчезают).
+Кадр обязан показывать то, о чём говорит фраза, с помощью актёров из cast. Всё живое движется: персонажи идут (to) и жестикулируют (их части качаются сами), предметы переезжают, облака плывут. Ставь 3-8 актёров, главный крупнее всех и ближе к центру. Один и тот же актёр обязан быть одним и тем же во всех сценах."""
+
+def rules(kind):
+    r = (CFG.get("editor_rules" if kind == "e" else "writer_rules") or "").strip()
+    return f"\n\nПостоянные правила владельца канала (соблюдай строго, они важнее остальных пожеланий):\n{r}" if r else ""
+
+def ask_json(prompt, max_tokens):
+    r = Anthropic(api_key=KEY).messages.create(model=MODEL, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}])
+    txt = "".join(b.text for b in r.content if b.type == "text")
+    return json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
+
+def make_cast(d):
+    scenes = "\n".join(f"{n+1}. {s['text']} [{s.get('image', '')}]" for n, s in enumerate(d["scenes"]))
+    chars = "; ".join(d.get("characters", [])) or "определи сам"
+    cast = ask_json(f"Видео: «{d['title']}». Стиль: {d.get('style') or 'flat cartoon'}.\nГлавные персонажи и предметы: {chars}.\n"
+                    f"Сцены:\n{scenes}\n\n" + CAST_RULES + "\n" + SHAPES_DOC + rules("e"), 16000)["assets"]
+    if not cast or not all(a.get("parts") for a in cast): raise RuntimeError("пустой набор актёров")
+    return cast
+
+def make_stage(s, d, cast):
+    brief = "; ".join(f"{a['id']} (части: {', '.join(p.get('name', '?') for p in a['parts'])})" for a in cast)
+    return ask_json(f"Ты режиссёр мультфильма для YouTube Shorts. Видео: «{d['title']}». Поставь кадр к фразе диктора: «{s['text']}»\n"
+                    f"Что показать: {s.get('image') or s['text']}\nСтиль: {d.get('style') or 'flat cartoon'}\n"
+                    f"Доступные актёры (cast): {brief}\n\n" + SHAPES_DOC + "\n" + STAGE_RULES + rules("e"), 8000)
+
+def draw_shapes(d, shapes, k, ox=0.0, oy=0.0):
+    import math
+    P = lambda p: [(float(x) * k + ox, float(y) * k + oy) for x, y in p]
+
+    def smooth(pts):  # срезаем углы: получается плавная форма
+        for _ in range(3):
+            new = []
+            for j in range(len(pts)):
+                a, b = pts[j], pts[(j + 1) % len(pts)]
+                new += [(.75 * a[0] + .25 * b[0], .75 * a[1] + .25 * b[1]), (.25 * a[0] + .75 * b[0], .25 * a[1] + .75 * b[1])]
+            pts = new
+        return pts
+
+    for sh in shapes[:150]:
         try:
-            download(u, path)
-            if Path(path).stat().st_size > 5000: return
-        except Exception as e:
-            last = e
-        time.sleep(8 * (k + 1))
-    raise RuntimeError(last or "пустой ответ")
+            t, c = sh["t"], sh["c"]
+            if t == "rect":
+                x, y = float(sh["x"]) * k + ox, float(sh["y"]) * k + oy; w, h = float(sh["w"]) * k, float(sh["h"]) * k
+                r = float(sh.get("r", 0)) * k
+                d.rounded_rectangle((x, y, x + w, y + h), r, fill=c) if r else d.rectangle((x, y, x + w, y + h), fill=c)
+            elif t == "circle":
+                x, y, r = float(sh["x"]) * k + ox, float(sh["y"]) * k + oy, float(sh["r"]) * k
+                d.ellipse((x - r, y - r, x + r, y + r), fill=c)
+            elif t == "ellipse":
+                x, y, rx, ry = float(sh["x"]) * k + ox, float(sh["y"]) * k + oy, float(sh["rx"]) * k, float(sh["ry"]) * k
+                a = math.radians(float(sh.get("rot", 0)))
+                d.polygon([(x + rx * math.cos(q) * math.cos(a) - ry * math.sin(q) * math.sin(a),
+                            y + rx * math.cos(q) * math.sin(a) + ry * math.sin(q) * math.cos(a))
+                           for q in (j * math.pi / 30 for j in range(60))], fill=c)
+            elif t == "poly": d.polygon(P(sh["p"]), fill=c)
+            elif t == "blob": d.polygon(smooth(P(sh["p"])), fill=c)
+            elif t == "line": d.line(P(sh["p"]), fill=c, width=max(1, int(float(sh.get("w", 1)) * k)), joint="curve")
+        except Exception:
+            continue  # одна кривая фигура не должна ломать весь рисунок
 
-def replicate_image(prompt, path):  # платный, но дешёвый и надёжный генератор FLUX (≈0,3 цента за картинку)
-    import urllib.request
-    H = {"Authorization": "Bearer " + REPLICATE, "Content-Type": "application/json", "Prefer": "wait=60"}
-    body = json.dumps({"input": {"prompt": prompt, "aspect_ratio": "9:16", "output_format": "jpg", "num_outputs": 1}}).encode()
-    r = json.load(urllib.request.urlopen(urllib.request.Request(
-        "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions", body, H), timeout=90))
-    for _ in range(30):
-        if r.get("status") == "succeeded": break
-        if r.get("status") in ("failed", "canceled"): raise RuntimeError(r.get("error") or r["status"])
-        time.sleep(2)
-        r = json.load(urllib.request.urlopen(urllib.request.Request(r["urls"]["get"], headers=H), timeout=30))
-    out = r["output"]
-    download(out[0] if isinstance(out, list) else out, path)
+def render_bg(stage):
+    from PIL import Image, ImageDraw
+    SS = 2
+    bg = (stage or {}).get("bg") or ["#1e3a8a", "#0ea5e9"]
+    img = Image.composite(Image.new("RGB", (W * SS, H * SS), bg[-1]), Image.new("RGB", (W * SS, H * SS), bg[0]),
+                          Image.linear_gradient("L").resize((W * SS, H * SS)))
+    draw_shapes(ImageDraw.Draw(img, "RGBA"), (stage or {}).get("shapes", []), U * SS)
+    return img.resize((W, H), Image.LANCZOS)
 
-def pixabay_image(q, path):  # запасной вариант: настоящие фото
-    import urllib.parse, urllib.request
-    u = "https://pixabay.com/api/?" + urllib.parse.urlencode({"key": PIXABAY, "q": q[:100], "image_type": "photo",
-        "orientation": "vertical", "per_page": 15, "safesearch": "true"})
-    hits = json.load(urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=30))["hits"]
-    if not hits: raise RuntimeError("ничего не найдено")
-    download(random.choice(hits[:8])["largeImageURL"], path)
+def make_sprite(part, size):
+    """Часть актёра как прозрачная картинка; вокруг запас в 25 единиц, чтобы часть могла качаться."""
+    from PIL import Image, ImageDraw
+    k = size * U / 100; side = max(8, int(150 * k)); SS = 2 if side <= 1100 else 1
+    img = Image.new("RGBA", (side * SS, side * SS), (0, 0, 0, 0))
+    draw_shapes(ImageDraw.Draw(img), part.get("shapes", []), k * SS, 25 * k * SS, 25 * k * SS)
+    return img.resize((side, side), Image.LANCZOS) if SS > 1 else img
 
-async def get_image(path, s, d):
-    steps = []
-    if s.get("image"):
-        p = f"{s['image']}, {d.get('style', '')}, cinematic, detailed, vertical composition, no text, no letters, no watermark"
-        if REPLICATE: steps.append(("Replicate", replicate_image, p))
-        steps.append(("бесплатный генератор", gen_image, p))
-    if PIXABAY and (s.get("search") or s.get("image")): steps.append(("Pixabay", pixabay_image, s.get("search") or s["image"]))
-    for name, fn, arg in steps:
-        try:
-            await asyncio.to_thread(fn, arg, path)
-            return path
-        except Exception as e:
-            log(f"Монтажёр: {name} не дал картинку ({e})")
-    return None
+def build_actors(stage, cast):
+    from PIL import ImageOps
+    by, out = {a["id"]: a for a in cast}, []
+    for ac in (stage or {}).get("actors", [])[:12]:
+        a = by.get(ac.get("asset"))
+        if not a: continue
+        size = max(5.0, min(120.0, float(ac.get("size", 40)))); k = size * U / 100; flip = bool(ac.get("flip")); parts = []
+        for p in a["parts"][:12]:
+            sp, pv = make_sprite(p, size), p.get("pivot", [50, 50])
+            px, py = (float(pv[0]) + 25) * k, (float(pv[1]) + 25) * k
+            if flip: sp, px = ImageOps.mirror(sp), sp.width - px
+            parts.append((sp, (px, py), p.get("anim") or {}))
+        x, y = float(ac.get("x", 50)), float(ac.get("y", 100))
+        out.append({"parts": parts, "k": k, "x": x, "y": y, "to": ac.get("to") or [x, y], "flip": flip,
+                    "bob": ac.get("bob") or {}, "show": ac.get("show") or [0, 1]})
+    return out
 
-PALETTES = [("#1e1b4b", "#7c3aed"), ("#0f172a", "#0ea5e9"), ("#431407", "#f97316"),
-            ("#052e16", "#22c55e"), ("#4c0519", "#f43f5e"), ("#172554", "#06b6d4")]
+def ease(t): return t * t * (3 - 2 * t)
+
+def compose(bg, actors, t, sec, overlay):
+    import math
+    from PIL import Image
+    fr = bg.copy()
+    for ac in actors:
+        if not (ac["show"][0] <= t <= ac["show"][1]): continue
+        e = ease(t)
+        cx = (ac["x"] + (float(ac["to"][0]) - ac["x"]) * e) * U
+        cy = (ac["y"] + (float(ac["to"][1]) - ac["y"]) * e) * U
+        if ac["bob"]: cy -= abs(math.sin(math.pi * float(ac["bob"].get("speed", 1)) * sec)) * float(ac["bob"].get("amp", 1)) * U
+        ox, oy = cx - 75 * ac["k"], cy - 75 * ac["k"]
+        for sp, (px, py), an in ac["parts"]:
+            ty, amp = an.get("type", "none"), float(an.get("amp", 0))
+            ph = 2 * math.pi * (float(an.get("speed", 0)) * sec + float(an.get("phase", 0)))
+            ang = dx = dy = 0.0
+            if ty == "swing": ang = amp * math.sin(ph) * (-1 if ac["flip"] else 1)
+            elif ty == "spin": ang = math.degrees(ph)
+            elif ty == "sway": dx = amp * math.sin(ph) * U
+            elif ty == "bob": dy = amp * math.sin(ph) * U
+            img = sp.rotate(ang, center=(px, py), resample=Image.BICUBIC) if abs(ang) > 0.3 else sp
+            fr.paste(img, (int(ox + dx), int(oy + dy)), img)
+    if overlay: fr.paste(overlay, (0, H - overlay.height), overlay)
+    return fr
 
 def font_path():
     for p in (BASE / "font.ttf", Path("C:/Windows/Fonts/arialbd.ttf"),
@@ -234,34 +313,36 @@ def chunks(text, maxw=7):
         out += [" ".join(w[i:i + size]) for i in range(0, len(w), size)]
     return [c for c in out if c] or [text]
 
-def scene_png(text, n, total, path, photo=None):
-    """Кадр: картинка (или мягкий фон), маленькие субтитры внизу и тонкая полоса прогресса."""
-    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
-    W, H, fp = 1080, 1920, font_path()
-    if photo:
-        img = ImageOps.fit(Image.open(photo).convert("RGB"), (W, H)).convert("RGBA")
-    else:
-        c1, c2 = random.choice(PALETTES)
-        bg = Image.composite(Image.new("RGB", (W, H), c2), Image.new("RGB", (W, H), c1),
-                             Image.linear_gradient("L").resize((W, H)))
-        img = bg.convert("RGBA")
-    shade = Image.new("RGBA", (W, 650), (0, 0, 0, 255))
-    shade.putalpha(Image.linear_gradient("L").resize((W, 650)).point(lambda v: int(v * 0.75)))
-    img.alpha_composite(shade, (0, H - 650))
-    d = ImageDraw.Draw(img)
-    f, lines, cur = ImageFont.truetype(fp, 46), [], ""
+def sub_overlay(text, n, total):
+    """Нижняя часть кадра: затемнение, маленькие субтитры и тонкая полоса прогресса."""
+    from PIL import Image, ImageDraw, ImageFont
+    h = 700
+    ov = Image.new("RGBA", (W, h), (0, 0, 0, 0))
+    shade = Image.new("RGBA", (W, h), (0, 0, 0, 255))
+    shade.putalpha(Image.linear_gradient("L").resize((W, h)).point(lambda v: int(v * 0.75)))
+    ov.alpha_composite(shade)
+    d, f, lines, cur = ImageDraw.Draw(ov), ImageFont.truetype(font_path(), 46), [], ""
     for w in text.split():
         tst = (cur + " " + w).strip()
         if f.getlength(tst) <= 900: cur = tst
         else: lines.append(cur); cur = w
     lines = [l for l in lines + [cur] if l]
-    y = H - 330 - len(lines) * 60
+    y = h - 330 - len(lines) * 60
     for l in lines:
-        d.text(((W - f.getlength(l)) / 2, y), l, font=f, fill="white", stroke_width=3, stroke_fill="black")
-        y += 60
-    d.rounded_rectangle((160, H - 260, 920, H - 254), 3, fill=(255, 255, 255, 60))
-    d.rounded_rectangle((160, H - 260, 160 + 760 * (n + 1) / total, H - 254), 3, fill="#fde047")
-    img.convert("RGB").save(path)
+        d.text(((W - f.getlength(l)) / 2, y), l, font=f, fill="white", stroke_width=3, stroke_fill="black"); y += 60
+    d.rounded_rectangle((160, h - 260, 920, h - 254), 3, fill=(255, 255, 255, 60))
+    d.rounded_rectangle((160, h - 260, 160 + 760 * (n + 1) / total, h - 254), 3, fill="#fde047")
+    return ov
+
+def scene_frames(i, n, stage, cast, parts, total, nframes):
+    """Рисует все кадры сцены: фон, актёры с движением частей и субтитры."""
+    bg, actors = render_bg(stage), build_actors(stage, cast)
+    acc, bounds, s = 0, [], sum(len(c) for c in parts)
+    for c in parts:
+        acc += len(c); bounds.append((acc / s, sub_overlay(c, n, total)))
+    for f in range(nframes):
+        ov = next((o for b, o in bounds if f / nframes < b), bounds[-1][1])
+        compose(bg, actors, f / max(1, nframes - 1), f / FPS, ov).save(f"videos/{i}_{n}_{f:04d}.jpg", quality=90)
 
 async def render(i, d):
     import imageio_ffmpeg
@@ -277,31 +358,34 @@ async def render(i, d):
                                                  stderr=asyncio.subprocess.DEVNULL)
         return await p.wait() == 0
 
-    segs, fails, last = [], 0, None
+    async def retry(fn, what, *args):
+        for _ in range(2):
+            try: return await asyncio.to_thread(fn, *args)
+            except Exception as e: log(f"Монтажёр: {what} не получилось ({e})")
+        return None
+
+    setag("editor", "working", "Придумывает и рисует персонажей")
+    cast = await retry(make_cast, "создание персонажей", d) or []
+    sem = asyncio.Semaphore(3)
+
+    async def stage(s):
+        async with sem:
+            return await retry(make_stage, "постановка кадра", s, d, cast) if cast else None
+
+    stages = await asyncio.gather(*(stage(s) for s in scenes))
+    segs, last = [], None
     for n, s in enumerate(scenes):
-        sd = dur * len(s["text"]) / total
-        photo = None
-        if fails < 2:  # если картинки два раза подряд не получились, дальше повторяем последнюю
-            photo = await get_image(f"videos/{i}_{n}.jpg", s, d)
-            fails = 0 if photo else fails + 1
-        photo = photo or last
-        last = photo or last
-        parts = chunks(s["text"])
-        tot_frames, off = max(2, round(sd * 30)), 0
-        z0, z1 = (1.0, 1.12) if n % 2 == 0 else (1.12, 1.0)  # плавное приближение / отдаление
-        for k, ch in enumerate(parts):
-            cd = sd * len(ch) / sum(len(c) for c in parts)
-            frames = max(2, round(cd * 30))
-            png, seg = f"videos/{i}_{n}_{k}.png", f"videos/{i}_{n}_{k}.mp4"
-            await asyncio.to_thread(scene_png, ch, n, len(scenes), png, photo)
-            zoom = (f"scale=1620:2880,zoompan=z='{z0}+({z1}-{z0})*(on+{off})/{tot_frames}':x='iw/2-(iw/zoom/2)':"
-                    f"y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30,format=yuv420p")
-            ok = await run("-i", png, "-vf", zoom, "-t", f"{cd:.2f}", "-c:v", "libx264", "-preset", "veryfast", seg)
-            if not ok:  # запасной вариант без движения
-                ok = await run("-loop", "1", "-i", png, "-t", f"{cd:.2f}", "-vf", "scale=1080:1920,fps=30,format=yuv420p",
-                               "-c:v", "libx264", "-preset", "veryfast", seg)
-            if not ok: raise RuntimeError("ffmpeg не смог собрать сцену")
-            segs.append(Path(seg).name); off += frames
+        setag("editor", "working", f"Анимирует сцену {n+1} из {len(scenes)}")
+        st = stages[n] or last  # если кадр не поставился, берём предыдущий
+        last = st or last
+        nframes = max(2, round(dur * len(s["text"]) / total * FPS))
+        await asyncio.to_thread(scene_frames, i, n, st, cast, chunks(s["text"]), len(scenes), nframes)
+        seg = f"videos/{i}_{n}.mp4"
+        if not await run("-framerate", str(FPS), "-i", f"videos/{i}_{n}_%04d.jpg", "-vf", "fps=30,format=yuv420p",
+                         "-c:v", "libx264", "-preset", "veryfast", seg):
+            raise RuntimeError("ffmpeg не смог собрать сцену")
+        for x in glob.glob(f"videos/{i}_{n}_*.jpg"): os.remove(x)
+        segs.append(Path(seg).name)
     lst = f"videos/{i}_list.txt"
     Path(lst).write_text("".join(f"file '{x}'\n" for x in segs))
     if not await run("-f", "concat", "-safe", "0", "-i", lst, "-i", mp3, "-map", "0:v", "-map", "1:a",
@@ -431,20 +515,18 @@ class Settings(BaseModel):
     voice: str
     privacy: str
     hit_views: int
-    replicate_key: str = ""
-    pixabay_key: str = ""
+    writer_rules: str = ""
+    editor_rules: str = ""
 
 @app.get("/api/settings")
 def get_settings():
-    return {**{k: v for k, v in CFG.items() if k not in ("api_key", "replicate_key", "pixabay_key")}, "has_key": bool(KEY), "has_replicate": bool(REPLICATE), "has_pixabay": bool(PIXABAY),
+    return {**{k: v for k, v in CFG.items() if k != "api_key"}, "has_key": bool(KEY),
             "has_client": os.path.exists("client_secret.json"), "has_token": os.path.exists("token.json")}
 
 @app.post("/api/settings")
 def set_settings(s: Settings):
     new = s.model_dump()
     if not new["api_key"]: new["api_key"] = KEY
-    if not new["replicate_key"]: new["replicate_key"] = REPLICATE
-    if not new["pixabay_key"]: new["pixabay_key"] = PIXABAY
     SF.write_text(json.dumps(new, ensure_ascii=False), "utf-8"); apply_settings(new)
     return {"ok": True}
 
