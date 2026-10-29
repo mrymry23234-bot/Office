@@ -6,7 +6,7 @@ from pathlib import Path
 import edge_tts
 import uvicorn
 from anthropic import Anthropic
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -79,12 +79,23 @@ def fetch_stats(ids):
     return {i["id"]: int(i["statistics"].get("viewCount", 0)) for i in r["items"]}
 
 # ---- агент 1: сценарист ----
+def revise(d, notes):
+    prompt = (f"Вот сценарий YouTube Shorts в формате JSON:\n{json.dumps(d, ensure_ascii=False)}\n\n"
+              f"Правки владельца канала: {notes}\n\nВнеси правки: можно менять фразы, порядок и число сцен, "
+              "описания картинок (поля image и style, на английском), название и описание. "
+              f"Язык озвучки: {LANG}. Сохрани тот же формат JSON. Ответь только JSON.")
+    r = Anthropic(api_key=KEY).messages.create(model=MODEL, max_tokens=8000, messages=[{"role": "user", "content": prompt}])
+    s = "".join(b.text for b in r.content if b.type == "text")
+    nd = json.loads(s[s.find("{"): s.rfind("}") + 1])
+    nd["narration"] = " ".join(x["text"] for x in nd["scenes"])
+    return nd
+
 def gen_script(insights, titles):
     prompt = (f"Ты сценарист YouTube Shorts в нише «{NICHE}». Язык: {LANG}.\n"
               f"Аналитика канала: {insights}\nУже были темы (не повторяй): {titles}\n"
               "Придумай новую тему и напиши сценарий на 25-35 секунд. Первая фраза: сильный хук. "
-              'Ответь только JSON: {"title":"","scenes":[{"headline":"1-3 слова, главная мысль сцены","text":"1-2 короткие фразы для озвучки"}],"description":"","tags":[]}. '
-              'Сцен 6-9. headline крупно выводится на экране: коротко, без эмодзи.')
+              'Ответь только JSON: {"title":"","style":"единый визуальный стиль всех картинок, 5-10 английских слов","scenes":[{"text":"1-2 короткие фразы для озвучки","image":"конкретное описание картинки к фразе на английском: кто и что изображено, место, настроение, 15-25 слов"}],"description":"","tags":[]}. '
+              'Сцен 6-9. Картинка должна точно показывать то, о чём говорит фраза (например, пирамиды, египтяне, пустыня), без текста на картинке.')
     r = Anthropic(api_key=KEY).messages.create(model=MODEL, max_tokens=8000, messages=[{"role": "user", "content": prompt}])
     t = "".join(b.text for b in r.content if b.type == "text")
     d = json.loads(t[t.find("{"): t.rfind("}") + 1])
@@ -93,6 +104,18 @@ def gen_script(insights, titles):
 
 async def writer_loop():
     while True:
+        rv = q("select * from items where status='script_revise' limit 1")
+        if rv:
+            rv = rv[0]; setag("writer", "working", "Переписывает по вашим правкам")
+            d = json.loads(rv["data"]); notes = d.pop("notes", "")
+            try:
+                d = await asyncio.to_thread(revise, d, notes)
+                q("update items set status='script_pending', title=?, data=? where id=?",
+                  d["title"], json.dumps(d, ensure_ascii=False), rv["id"])
+                log("Сценарист: сценарий переработан по вашим правкам")
+            except Exception as e:
+                q("update items set status='script_pending' where id=?", rv["id"]); log(f"Сценарист: не смог внести правки ({e})")
+            continue
         n = q("select count(*) c from items where status='script_pending'")[0]["c"]
         if KEY and n < MAX_PENDING:
             setag("writer", "working", "Пишет сценарий")
@@ -120,18 +143,33 @@ def make_srt(text, dur):
         out.append(f"{i}\n{ts(t)} --> {ts(e)}\n{p}\n"); t = e
     return "\n".join(out)
 
-async def tts(text, path):
+async def tts(text, path, voice=None):
+    voice = voice or VOICE
     text = re.sub(r"[^\w\s.,!?;:()«»\"'—–-]", " ", text)  # убираем эмодзи и странные символы
     text = re.sub(r"\s+", " ", text).strip()
-    voices = [VOICE, VOICE] + (["ru-RU-SvetlanaNeural"] if VOICE.startswith("ru-") else [])
     last = None
-    for v in voices:  # сервис озвучки иногда отвечает ошибкой: пробуем ещё раз
+    for _ in range(4):  # сервис озвучки иногда отвечает ошибкой: пробуем тот же голос ещё раз
         try:
-            await edge_tts.Communicate(text, v).save(path)
+            await edge_tts.Communicate(text, voice).save(path)
             if Path(path).stat().st_size > 0: return
         except Exception as e:
-            last = e; await asyncio.sleep(2)
-    raise RuntimeError(f"озвучка не получилась: {last}")
+            last = e; await asyncio.sleep(3)
+    raise RuntimeError(f"голос {voice} недоступен: {last}")
+
+def gen_image(prompt, path, seed):
+    import urllib.parse, urllib.request
+    u = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt[:500]) +
+         f"?width=1080&height=1920&model=flux&nologo=true&seed={seed}")
+    last = None
+    for _ in range(2):
+        try:
+            data = urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}), timeout=90).read()
+            if len(data) > 5000:
+                Path(path).write_bytes(data); return
+        except Exception as e:
+            last = e
+        time.sleep(4)
+    raise RuntimeError(last or "пустой ответ")
 
 PALETTES = [("#1e1b4b", "#7c3aed"), ("#0f172a", "#0ea5e9"), ("#431407", "#f97316"),
             ("#052e16", "#22c55e"), ("#4c0519", "#f43f5e"), ("#172554", "#06b6d4")]
@@ -142,18 +180,24 @@ def font_path():
         if Path(p).exists(): return str(p)
     raise RuntimeError("не найден файл шрифта font.ttf")
 
-def scene_png(text, head, label, n, total, path):
+def scene_png(text, head, label, n, total, path, photo=None):
     """Рисует кадр сцены: градиент, мягкие круги, крупный заголовок, фраза и полоса прогресса."""
-    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
     W, H, fp = 1080, 1920, font_path()
-    c1, c2 = random.choice(PALETTES)
-    bg = Image.composite(Image.new("RGB", (W, H), c2), Image.new("RGB", (W, H), c1),
-                         Image.linear_gradient("L").resize((W, H)))
-    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0)); od = ImageDraw.Draw(ov)
-    for _ in range(5):
-        r, x, y = random.randint(150, 420), random.randint(-100, W), random.randint(-100, H)
-        od.ellipse((x - r, y - r, x + r, y + r), fill=(255, 255, 255, 34))
-    img = Image.alpha_composite(bg.convert("RGBA"), ov.filter(ImageFilter.GaussianBlur(30)))
+    if photo:
+        img = ImageOps.fit(Image.open(photo).convert("RGB"), (W, H)).convert("RGBA")
+        shade = Image.new("RGBA", (W, 950), (0, 0, 0, 255))
+        shade.putalpha(Image.linear_gradient("L").resize((W, 950)).point(lambda v: int(v * 0.88)))
+        img.alpha_composite(shade, (0, H - 950)); head = ""
+    else:
+        c1, c2 = random.choice(PALETTES)
+        bg = Image.composite(Image.new("RGB", (W, H), c2), Image.new("RGB", (W, H), c1),
+                             Image.linear_gradient("L").resize((W, H)))
+        ov = Image.new("RGBA", (W, H), (0, 0, 0, 0)); od = ImageDraw.Draw(ov)
+        for _ in range(5):
+            r, x, y = random.randint(150, 420), random.randint(-100, W), random.randint(-100, H)
+            od.ellipse((x - r, y - r, x + r, y + r), fill=(255, 255, 255, 34))
+        img = Image.alpha_composite(bg.convert("RGBA"), ov.filter(ImageFilter.GaussianBlur(30)))
     d = ImageDraw.Draw(img)
 
     def block(s, size, maxw, maxh):
@@ -175,13 +219,14 @@ def scene_png(text, head, label, n, total, path):
         return y
 
     hf, hl, hs = block(head.upper(), 120, 900, 520) if head else (None, [], 0)
-    bf, bl, bs = block(text, 64, 880, 760)
+    bf, bl, bs = block(text, 60 if photo else 64, 880, 420 if photo else 760)
     total_h = len(hl) * hs * 1.25 + (50 if hl else 0) + len(bl) * bs * 1.25
-    y = (H - total_h) / 2 - 60
+    y = H - 300 - len(bl) * bs * 1.25 if photo else (H - total_h) / 2 - 60
     if hl: y = draw_lines(hf, hl, hs, y, "#fde047") + 50
     draw_lines(bf, bl, bs, y, "white")
-    lf, ll, ls = block(label, 44, 900, 140)
-    draw_lines(lf, ll, ls, 190, (255, 255, 255, 170))
+    if not photo:
+        lf, ll, ls = block(label, 44, 900, 140)
+        draw_lines(lf, ll, ls, 190, (255, 255, 255, 170))
     d.rounded_rectangle((160, H - 260, 920, H - 250), 5, fill=(255, 255, 255, 70))
     d.rounded_rectangle((160, H - 260, 160 + 760 * (n + 1) / total, H - 250), 5, fill="#fde047")
     img.convert("RGB").save(path)
@@ -200,11 +245,20 @@ async def render(i, d):
                                                  stderr=asyncio.subprocess.DEVNULL)
         return await p.wait() == 0
 
-    segs = []
+    segs, fails = [], 0
     for n, s in enumerate(scenes):
         sd = dur * len(s["text"]) / total
         png, seg, frames = f"videos/{i}_{n}.png", f"videos/{i}_{n}.mp4", max(2, round(sd * 30))
-        await asyncio.to_thread(scene_png, s["text"], s.get("headline", ""), d["title"], n, len(scenes), png)
+        photo = None
+        if s.get("image") and fails < 2:  # две неудачи подряд: дальше без картинок, графикой
+            try:
+                photo = f"videos/{i}_{n}.jpg"
+                await asyncio.to_thread(gen_image, f"{s['image']}, {d.get('style', '')}, cinematic, detailed, no text, no watermark",
+                                        photo, random.randint(1, 99999))
+                fails = 0
+            except Exception as e:
+                photo = None; fails += 1; log(f"Монтажёр: картинка к сцене {n+1} не создалась ({e}), рисую графику")
+        await asyncio.to_thread(scene_png, s["text"], s.get("headline", ""), d["title"], n, len(scenes), png, photo)
         z0, z1 = (1.0, 1.12) if n % 2 == 0 else (1.12, 1.0)  # плавное приближение / отдаление
         zoom = (f"scale=1620:2880,zoompan=z='{z0}+({z1}-{z0})*on/{frames}':x='iw/2-(iw/zoom/2)':"
                 f"y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30,fade=t=in:st=0:d=0.2,format=yuv420p")
@@ -234,6 +288,18 @@ async def editor_loop():
                 log("Монтажёр: видео готово «" + r["title"] + "»")
             except Exception as e:
                 q("update items set status='render_failed' where id=?", r["id"]); log(f"Монтажёр: ошибка {e}")
+            continue
+        r = q("select * from items where status='video_revise' limit 1")
+        if r:
+            r = r[0]; setag("editor", "working", "Учитывает ваши правки: " + r["title"])
+            d = json.loads(r["data"]); notes = d.pop("notes", "")
+            try:
+                d = await asyncio.to_thread(revise, d, notes)
+                q("update items set status='script_approved', title=?, data=? where id=?",
+                  d["title"], json.dumps(d, ensure_ascii=False), r["id"])
+                log("Монтажёр: правки приняты, пересобираю видео")
+            except Exception as e:
+                q("update items set status='video_pending' where id=?", r["id"]); log(f"Монтажёр: не смог внести правки ({e})")
             continue
         r = q("select * from items where status='video_approved' limit 1")
         if r:
@@ -279,7 +345,8 @@ app = FastAPI(lifespan=lifespan)
 
 class Decision(BaseModel):
     id: int
-    ok: bool
+    ok: bool = False
+    revise: str = ""
 
 @app.get("/api/state")
 def state():
@@ -293,11 +360,29 @@ def state():
 
 @app.post("/api/decide")
 def decide(d: Decision):
-    r = q("select status from items where id=?", d.id)
+    r = q("select status, data from items where id=?", d.id)
+    if not r: return {"ok": False}
+    st = r[0]["status"]
+    if d.revise.strip() and st in ("script_pending", "video_pending"):  # отправить на доработку
+        data = json.loads(r[0]["data"]); data["notes"] = d.revise.strip()
+        q("update items set status=?, data=? where id=?", st.replace("_pending", "_revise"),
+          json.dumps(data, ensure_ascii=False), d.id)
+        return {"ok": True}
     nxt = {"script_pending": ("script_approved", "script_rejected"),
-           "video_pending": ("video_approved", "video_rejected")}.get(r[0]["status"]) if r else None
+           "video_pending": ("video_approved", "video_rejected")}.get(st)
     if nxt: q("update items set status=? where id=?", nxt[0 if d.ok else 1], d.id)
     return {"ok": True}
+
+@app.get("/api/voice_test")
+async def voice_test(voice: str):
+    if not re.fullmatch(r"[a-z]{2}-[A-Z]{2}-\w+Neural", voice): raise HTTPException(400)
+    sample = {"ru": "Привет! Так звучит этот голос.", "uk": "Привіт! Так звучить цей голос.",
+              "de": "Hallo! So klingt diese Stimme.", "es": "¡Hola! Así suena esta voz.",
+              "fr": "Bonjour ! Voici ma voix.", "pl": "Cześć! Tak brzmi ten głos."}.get(voice[:2], "Hello! This is how this voice sounds.")
+    path = f"videos/test_{voice}.mp3"
+    try: await tts(sample, path, voice)
+    except Exception: raise HTTPException(503)
+    return FileResponse(path, media_type="audio/mpeg")
 
 @app.get("/media/{i}")
 def media(i: int): return FileResponse(f"videos/{i}.mp4")
