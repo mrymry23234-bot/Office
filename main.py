@@ -20,14 +20,13 @@ else:
 MODEL, MAX_PENDING, STATS_EVERY = "claude-sonnet-5-5", 2, 3600
 SF = Path("settings.json")
 DEFAULTS = {"api_key": "", "niche": "интересные факты", "lang": "русский",
-            "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000, "pexels_key": "", "pixabay_key": ""}
+            "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000}
 
 def apply_settings(s=None):
-    global CFG, KEY, PEXELS, PIXABAY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
+    global CFG, KEY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
     if s is None: s = json.loads(SF.read_text("utf-8")) if SF.exists() else {}
     CFG = {**DEFAULTS, **s}
-    KEY, PEXELS, NICHE, LANG, VOICE = CFG["api_key"], CFG["pexels_key"], CFG["niche"], CFG["lang"], CFG["voice"]
-    PIXABAY = CFG["pixabay_key"]
+    KEY, NICHE, LANG, VOICE = CFG["api_key"], CFG["niche"], CFG["lang"], CFG["voice"]
     PRIVACY, HIT_VIEWS = CFG["privacy"], int(CFG["hit_views"])
 
 apply_settings()
@@ -84,8 +83,8 @@ def gen_script(insights, titles):
     prompt = (f"Ты сценарист YouTube Shorts в нише «{NICHE}». Язык: {LANG}.\n"
               f"Аналитика канала: {insights}\nУже были темы (не повторяй): {titles}\n"
               "Придумай новую тему и напиши сценарий на 25-35 секунд. Первая фраза: сильный хук. "
-              'Ответь только JSON: {"title":"","scenes":[{"text":"1-2 короткие фразы для озвучки","query":"2-3 английских слова для поиска подходящего видео"}],"description":"","tags":[]}. '
-              'Сцен 6-9. query должен конкретно показывать то, о чём говорит фраза.')
+              'Ответь только JSON: {"title":"","scenes":[{"headline":"1-3 слова, главная мысль сцены","text":"1-2 короткие фразы для озвучки"}],"description":"","tags":[]}. '
+              'Сцен 6-9. headline крупно выводится на экране: коротко, без эмодзи.')
     r = Anthropic(api_key=KEY).messages.create(model=MODEL, max_tokens=8000, messages=[{"role": "user", "content": prompt}])
     t = "".join(b.text for b in r.content if b.type == "text")
     d = json.loads(t[t.find("{"): t.rfind("}") + 1])
@@ -121,69 +120,104 @@ def make_srt(text, dur):
         out.append(f"{i}\n{ts(t)} --> {ts(e)}\n{p}\n"); t = e
     return "\n".join(out)
 
-def pixabay_clip(query, path):
-    import urllib.parse, urllib.request
-    ua = {"User-Agent": "Mozilla/5.0"}
-    u = "https://pixabay.com/api/videos/?" + urllib.parse.urlencode(
-        {"key": PIXABAY, "q": query, "per_page": 20, "safesearch": "true"})
-    hits = json.load(urllib.request.urlopen(urllib.request.Request(u, headers=ua), timeout=30))["hits"]
-    v = random.choice(hits[:10])["videos"]
-    url = next(v[k]["url"] for k in ("medium", "small", "large", "tiny") if v.get(k, {}).get("url"))
-    Path(path).write_bytes(urllib.request.urlopen(urllib.request.Request(url, headers=ua), timeout=120).read())
+async def tts(text, path):
+    text = re.sub(r"[^\w\s.,!?;:()«»\"'—–-]", " ", text)  # убираем эмодзи и странные символы
+    text = re.sub(r"\s+", " ", text).strip()
+    voices = [VOICE, VOICE] + (["ru-RU-SvetlanaNeural"] if VOICE.startswith("ru-") else [])
+    last = None
+    for v in voices:  # сервис озвучки иногда отвечает ошибкой: пробуем ещё раз
+        try:
+            await edge_tts.Communicate(text, v).save(path)
+            if Path(path).stat().st_size > 0: return
+        except Exception as e:
+            last = e; await asyncio.sleep(2)
+    raise RuntimeError(f"озвучка не получилась: {last}")
 
-def pexels_clip(query, path):
-    import urllib.parse, urllib.request
-    ua = {"User-Agent": "Mozilla/5.0"}
-    u = "https://api.pexels.com/videos/search?" + urllib.parse.urlencode(
-        {"query": query, "orientation": "portrait", "per_page": 8})
-    vids = json.load(urllib.request.urlopen(urllib.request.Request(u, headers={**ua, "Authorization": PEXELS}), timeout=30))["videos"]
-    v = random.choice(vids)
-    f = min((f for f in v["video_files"] if f["file_type"] == "video/mp4" and (f.get("width") or 0) >= 540),
-            key=lambda f: abs(f["width"] - 1080))
-    Path(path).write_bytes(urllib.request.urlopen(urllib.request.Request(f["link"], headers=ua), timeout=120).read())
+PALETTES = [("#1e1b4b", "#7c3aed"), ("#0f172a", "#0ea5e9"), ("#431407", "#f97316"),
+            ("#052e16", "#22c55e"), ("#4c0519", "#f43f5e"), ("#172554", "#06b6d4")]
+
+def font_path():
+    for p in (BASE / "font.ttf", Path("C:/Windows/Fonts/arialbd.ttf"),
+              Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf")):
+        if Path(p).exists(): return str(p)
+    raise RuntimeError("не найден файл шрифта font.ttf")
+
+def scene_png(text, head, label, n, total, path):
+    """Рисует кадр сцены: градиент, мягкие круги, крупный заголовок, фраза и полоса прогресса."""
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+    W, H, fp = 1080, 1920, font_path()
+    c1, c2 = random.choice(PALETTES)
+    bg = Image.composite(Image.new("RGB", (W, H), c2), Image.new("RGB", (W, H), c1),
+                         Image.linear_gradient("L").resize((W, H)))
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0)); od = ImageDraw.Draw(ov)
+    for _ in range(5):
+        r, x, y = random.randint(150, 420), random.randint(-100, W), random.randint(-100, H)
+        od.ellipse((x - r, y - r, x + r, y + r), fill=(255, 255, 255, 34))
+    img = Image.alpha_composite(bg.convert("RGBA"), ov.filter(ImageFilter.GaussianBlur(30)))
+    d = ImageDraw.Draw(img)
+
+    def block(s, size, maxw, maxh):
+        while True:
+            f, lines, cur = ImageFont.truetype(fp, size), [], ""
+            for w in s.split():
+                tst = (cur + " " + w).strip()
+                if f.getlength(tst) <= maxw: cur = tst
+                else: lines.append(cur); cur = w
+            lines = [l for l in lines + [cur] if l]
+            if len(lines) * size * 1.25 <= maxh or size <= 36: return f, lines, size
+            size -= 4
+
+    def draw_lines(f, lines, size, y, fill):
+        for l in lines:
+            x = (W - f.getlength(l)) / 2
+            d.text((x + 4, y + 4), l, font=f, fill=(0, 0, 0, 110)); d.text((x, y), l, font=f, fill=fill)
+            y += size * 1.25
+        return y
+
+    hf, hl, hs = block(head.upper(), 120, 900, 520) if head else (None, [], 0)
+    bf, bl, bs = block(text, 64, 880, 760)
+    total_h = len(hl) * hs * 1.25 + (50 if hl else 0) + len(bl) * bs * 1.25
+    y = (H - total_h) / 2 - 60
+    if hl: y = draw_lines(hf, hl, hs, y, "#fde047") + 50
+    draw_lines(bf, bl, bs, y, "white")
+    lf, ll, ls = block(label, 44, 900, 140)
+    draw_lines(lf, ll, ls, 190, (255, 255, 255, 170))
+    d.rounded_rectangle((160, H - 260, 920, H - 250), 5, fill=(255, 255, 255, 70))
+    d.rounded_rectangle((160, H - 260, 160 + 760 * (n + 1) / total, H - 250), 5, fill="#fde047")
+    img.convert("RGB").save(path)
 
 async def render(i, d):
     import imageio_ffmpeg
     from mutagen.mp3 import MP3
     ff = imageio_ffmpeg.get_ffmpeg_exe()
     mp3, out = f"videos/{i}.mp3", f"videos/{i}.mp4"
-    scenes = d.get("scenes") or [{"text": s, "query": "abstract background"}
-                                 for s in re.split(r"(?<=[.!?])\s+", d["narration"]) if s]
-    await edge_tts.Communicate(" ".join(s["text"] for s in scenes), VOICE).save(mp3)
+    scenes = d.get("scenes") or [{"text": s} for s in re.split(r"(?<=[.!?])\s+", d["narration"]) if s]
+    await tts(" ".join(s["text"] for s in scenes), mp3)
     dur, total = MP3(mp3).info.length, sum(len(s["text"]) for s in scenes)
-    base = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,format=yuv420p"
 
     async def run(*args):
         p = await asyncio.create_subprocess_exec(ff, "-y", *args, stdout=asyncio.subprocess.DEVNULL,
                                                  stderr=asyncio.subprocess.DEVNULL)
         return await p.wait() == 0
 
-    segs, srt, t = [], [], 0.0
+    segs = []
     for n, s in enumerate(scenes):
         sd = dur * len(s["text"]) / total
-        srt.append(f"{n+1}\n{ts(t)} --> {ts(t+sd)}\n{s['text']}\n"); t += sd
-        seg, clip, ok = f"videos/{i}_{n}.mp4", f"videos/{i}_{n}_src.mp4", False
-        if PIXABAY or PEXELS:
-            try:
-                await asyncio.to_thread(pixabay_clip if PIXABAY else pexels_clip, s["query"], clip)
-                ok = await run("-stream_loop", "-1", "-i", clip, "-t", f"{sd:.2f}", "-vf", base, "-an", "-c:v", "libx264", seg)
-            except Exception as e:
-                log(f"Монтажёр: нет клипа для «{s['query']}», беру фон ({e})")
-        if not ok:
-            color = random.choice(["0x1e1b4b", "0x064e3b", "0x7c2d12", "0x1e3a8a"])
-            ok = await run("-f", "lavfi", "-i", f"color=c={color}:s=1080x1920:r=30", "-t", f"{sd:.2f}",
-                           "-pix_fmt", "yuv420p", "-c:v", "libx264", seg)
+        png, seg, frames = f"videos/{i}_{n}.png", f"videos/{i}_{n}.mp4", max(2, round(sd * 30))
+        await asyncio.to_thread(scene_png, s["text"], s.get("headline", ""), d["title"], n, len(scenes), png)
+        z0, z1 = (1.0, 1.12) if n % 2 == 0 else (1.12, 1.0)  # плавное приближение / отдаление
+        zoom = (f"scale=1620:2880,zoompan=z='{z0}+({z1}-{z0})*on/{frames}':x='iw/2-(iw/zoom/2)':"
+                f"y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30,fade=t=in:st=0:d=0.2,format=yuv420p")
+        ok = await run("-i", png, "-vf", zoom, "-t", f"{sd:.2f}", "-c:v", "libx264", "-preset", "veryfast", seg)
+        if not ok:  # запасной вариант без движения
+            ok = await run("-loop", "1", "-i", png, "-t", f"{sd:.2f}", "-vf", "scale=1080:1920,fps=30,format=yuv420p",
+                           "-c:v", "libx264", "-preset", "veryfast", seg)
         if not ok: raise RuntimeError("ffmpeg не смог собрать сцену")
         segs.append(Path(seg).name)
-    Path(f"videos/{i}.srt").write_text("\n".join(srt), encoding="utf-8")
     lst = f"videos/{i}_list.txt"
     Path(lst).write_text("".join(f"file '{x}'\n" for x in segs))
-    sub = f"subtitles=videos/{i}.srt:force_style='FontSize=20,Alignment=2,MarginV=350,Outline=2'"
-    for vf in (sub, None):  # если субтитры не поддерживаются, соберём без них
-        args = ["-f", "concat", "-safe", "0", "-i", lst, "-i", mp3] + (["-vf", vf] if vf else []) + [
-            "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out]
-        if await run(*args): break
-    else:
+    if not await run("-f", "concat", "-safe", "0", "-i", lst, "-i", mp3, "-map", "0:v", "-map", "1:a",
+                     "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out):
         raise RuntimeError("ffmpeg завершился с ошибкой")
     for x in glob.glob(f"videos/{i}_*"): os.remove(x)
     return out
@@ -277,21 +311,17 @@ class Settings(BaseModel):
     lang: str
     voice: str
     privacy: str
-    pexels_key: str = ""
-    pixabay_key: str = ""
     hit_views: int
 
 @app.get("/api/settings")
 def get_settings():
-    return {**{k: v for k, v in CFG.items() if k not in ("api_key", "pexels_key", "pixabay_key")}, "has_key": bool(KEY), "has_pexels": bool(PEXELS), "has_pixabay": bool(PIXABAY),
+    return {**{k: v for k, v in CFG.items() if k != "api_key"}, "has_key": bool(KEY),
             "has_client": os.path.exists("client_secret.json"), "has_token": os.path.exists("token.json")}
 
 @app.post("/api/settings")
 def set_settings(s: Settings):
     new = s.model_dump()
     if not new["api_key"]: new["api_key"] = KEY
-    if not new["pexels_key"]: new["pexels_key"] = PEXELS
-    if not new["pixabay_key"]: new["pixabay_key"] = PIXABAY
     SF.write_text(json.dumps(new, ensure_ascii=False), "utf-8"); apply_settings(new)
     return {"ok": True}
 
