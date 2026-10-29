@@ -20,13 +20,15 @@ else:
 MODEL, MAX_PENDING, STATS_EVERY = "claude-sonnet-5-5", 2, 3600
 SF = Path("settings.json")
 DEFAULTS = {"api_key": "", "niche": "интересные факты", "lang": "русский",
-            "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000}
+            "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000,
+            "replicate_key": "", "pixabay_key": ""}
 
 def apply_settings(s=None):
-    global CFG, KEY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
+    global CFG, KEY, REPLICATE, PIXABAY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
     if s is None: s = json.loads(SF.read_text("utf-8")) if SF.exists() else {}
     CFG = {**DEFAULTS, **s}
     KEY, NICHE, LANG, VOICE = CFG["api_key"], CFG["niche"], CFG["lang"], CFG["voice"]
+    REPLICATE, PIXABAY = CFG["replicate_key"], CFG["pixabay_key"]
     PRIVACY, HIT_VIEWS = CFG["privacy"], int(CFG["hit_views"])
 
 apply_settings()
@@ -94,8 +96,8 @@ def gen_script(insights, titles):
     prompt = (f"Ты сценарист YouTube Shorts в нише «{NICHE}». Язык: {LANG}.\n"
               f"Аналитика канала: {insights}\nУже были темы (не повторяй): {titles}\n"
               "Придумай новую тему и напиши сценарий на 25-35 секунд. Первая фраза: сильный хук. "
-              'Ответь только JSON: {"title":"","style":"единый визуальный стиль всех картинок, 5-10 английских слов","scenes":[{"text":"1-2 короткие фразы для озвучки","image":"конкретное описание картинки к фразе на английском: кто и что изображено, место, настроение, 15-25 слов"}],"description":"","tags":[]}. '
-              'Сцен 6-9. Картинка должна точно показывать то, о чём говорит фраза (например, пирамиды, египтяне, пустыня), без текста на картинке.')
+              'Ответь только JSON: {"title":"","style":"единый визуальный стиль всех картинок, 5-10 английских слов","scenes":[{"text":"1-2 короткие фразы для озвучки","image":"конкретное описание картинки к фразе на английском: кто и что изображено, место, настроение, 15-25 слов","search":"2-3 английских слова для поиска настоящего фото"}],"description":"","tags":[]}. '
+              'Сцен 6-9. Картинка должна точно показывать то, о чём говорит фраза (например, пирамиды, египтяне, пустыня), Если речь об акулах, на картинке акулы; главный предмет фразы всегда в центре кадра. Никаких надписей, цифр и букв на картинке.')
     r = Anthropic(api_key=KEY).messages.create(model=MODEL, max_tokens=8000, messages=[{"role": "user", "content": prompt}])
     t = "".join(b.text for b in r.content if b.type == "text")
     d = json.loads(t[t.find("{"): t.rfind("}") + 1])
@@ -156,20 +158,62 @@ async def tts(text, path, voice=None):
             last = e; await asyncio.sleep(3)
     raise RuntimeError(f"голос {voice} недоступен: {last}")
 
-def gen_image(prompt, path, seed):
-    import urllib.parse, urllib.request
+UA = {"User-Agent": "Mozilla/5.0"}
+
+def download(url, path):
+    import urllib.request
+    Path(path).write_bytes(urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=90).read())
+
+def gen_image(prompt, path):  # бесплатный генератор Pollinations
+    import urllib.parse
     u = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt[:500]) +
-         f"?width=1080&height=1920&model=flux&nologo=true&seed={seed}")
+         f"?width=1080&height=1920&model=flux&nologo=true&seed={random.randint(1, 99999)}")
     last = None
-    for _ in range(2):
+    for k in range(3):
         try:
-            data = urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}), timeout=90).read()
-            if len(data) > 5000:
-                Path(path).write_bytes(data); return
+            download(u, path)
+            if Path(path).stat().st_size > 5000: return
         except Exception as e:
             last = e
-        time.sleep(4)
+        time.sleep(8 * (k + 1))
     raise RuntimeError(last or "пустой ответ")
+
+def replicate_image(prompt, path):  # платный, но дешёвый и надёжный генератор FLUX (≈0,3 цента за картинку)
+    import urllib.request
+    H = {"Authorization": "Bearer " + REPLICATE, "Content-Type": "application/json", "Prefer": "wait=60"}
+    body = json.dumps({"input": {"prompt": prompt, "aspect_ratio": "9:16", "output_format": "jpg", "num_outputs": 1}}).encode()
+    r = json.load(urllib.request.urlopen(urllib.request.Request(
+        "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions", body, H), timeout=90))
+    for _ in range(30):
+        if r.get("status") == "succeeded": break
+        if r.get("status") in ("failed", "canceled"): raise RuntimeError(r.get("error") or r["status"])
+        time.sleep(2)
+        r = json.load(urllib.request.urlopen(urllib.request.Request(r["urls"]["get"], headers=H), timeout=30))
+    out = r["output"]
+    download(out[0] if isinstance(out, list) else out, path)
+
+def pixabay_image(q, path):  # запасной вариант: настоящие фото
+    import urllib.parse, urllib.request
+    u = "https://pixabay.com/api/?" + urllib.parse.urlencode({"key": PIXABAY, "q": q[:100], "image_type": "photo",
+        "orientation": "vertical", "per_page": 15, "safesearch": "true"})
+    hits = json.load(urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=30))["hits"]
+    if not hits: raise RuntimeError("ничего не найдено")
+    download(random.choice(hits[:8])["largeImageURL"], path)
+
+async def get_image(path, s, d):
+    steps = []
+    if s.get("image"):
+        p = f"{s['image']}, {d.get('style', '')}, cinematic, detailed, vertical composition, no text, no letters, no watermark"
+        if REPLICATE: steps.append(("Replicate", replicate_image, p))
+        steps.append(("бесплатный генератор", gen_image, p))
+    if PIXABAY and (s.get("search") or s.get("image")): steps.append(("Pixabay", pixabay_image, s.get("search") or s["image"]))
+    for name, fn, arg in steps:
+        try:
+            await asyncio.to_thread(fn, arg, path)
+            return path
+        except Exception as e:
+            log(f"Монтажёр: {name} не дал картинку ({e})")
+    return None
 
 PALETTES = [("#1e1b4b", "#7c3aed"), ("#0f172a", "#0ea5e9"), ("#431407", "#f97316"),
             ("#052e16", "#22c55e"), ("#4c0519", "#f43f5e"), ("#172554", "#06b6d4")]
@@ -180,55 +224,43 @@ def font_path():
         if Path(p).exists(): return str(p)
     raise RuntimeError("не найден файл шрифта font.ttf")
 
-def scene_png(text, head, label, n, total, path, photo=None):
-    """Рисует кадр сцены: градиент, мягкие круги, крупный заголовок, фраза и полоса прогресса."""
+def chunks(text, maxw=7):
+    """Режет фразу на короткие субтитры (до 7 слов), стараясь рвать по знакам препинания."""
+    out = []
+    for part in re.split(r"(?<=[.!?,;:])\s+", text):
+        w = part.split()
+        k = -(-len(w) // maxw) or 1
+        size = -(-len(w) // k) if w else 1
+        out += [" ".join(w[i:i + size]) for i in range(0, len(w), size)]
+    return [c for c in out if c] or [text]
+
+def scene_png(text, n, total, path, photo=None):
+    """Кадр: картинка (или мягкий фон), маленькие субтитры внизу и тонкая полоса прогресса."""
     from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
     W, H, fp = 1080, 1920, font_path()
     if photo:
         img = ImageOps.fit(Image.open(photo).convert("RGB"), (W, H)).convert("RGBA")
-        shade = Image.new("RGBA", (W, 950), (0, 0, 0, 255))
-        shade.putalpha(Image.linear_gradient("L").resize((W, 950)).point(lambda v: int(v * 0.88)))
-        img.alpha_composite(shade, (0, H - 950)); head = ""
     else:
         c1, c2 = random.choice(PALETTES)
         bg = Image.composite(Image.new("RGB", (W, H), c2), Image.new("RGB", (W, H), c1),
                              Image.linear_gradient("L").resize((W, H)))
-        ov = Image.new("RGBA", (W, H), (0, 0, 0, 0)); od = ImageDraw.Draw(ov)
-        for _ in range(5):
-            r, x, y = random.randint(150, 420), random.randint(-100, W), random.randint(-100, H)
-            od.ellipse((x - r, y - r, x + r, y + r), fill=(255, 255, 255, 34))
-        img = Image.alpha_composite(bg.convert("RGBA"), ov.filter(ImageFilter.GaussianBlur(30)))
+        img = bg.convert("RGBA")
+    shade = Image.new("RGBA", (W, 650), (0, 0, 0, 255))
+    shade.putalpha(Image.linear_gradient("L").resize((W, 650)).point(lambda v: int(v * 0.75)))
+    img.alpha_composite(shade, (0, H - 650))
     d = ImageDraw.Draw(img)
-
-    def block(s, size, maxw, maxh):
-        while True:
-            f, lines, cur = ImageFont.truetype(fp, size), [], ""
-            for w in s.split():
-                tst = (cur + " " + w).strip()
-                if f.getlength(tst) <= maxw: cur = tst
-                else: lines.append(cur); cur = w
-            lines = [l for l in lines + [cur] if l]
-            if len(lines) * size * 1.25 <= maxh or size <= 36: return f, lines, size
-            size -= 4
-
-    def draw_lines(f, lines, size, y, fill):
-        for l in lines:
-            x = (W - f.getlength(l)) / 2
-            d.text((x + 4, y + 4), l, font=f, fill=(0, 0, 0, 110)); d.text((x, y), l, font=f, fill=fill)
-            y += size * 1.25
-        return y
-
-    hf, hl, hs = block(head.upper(), 120, 900, 520) if head else (None, [], 0)
-    bf, bl, bs = block(text, 60 if photo else 64, 880, 420 if photo else 760)
-    total_h = len(hl) * hs * 1.25 + (50 if hl else 0) + len(bl) * bs * 1.25
-    y = H - 300 - len(bl) * bs * 1.25 if photo else (H - total_h) / 2 - 60
-    if hl: y = draw_lines(hf, hl, hs, y, "#fde047") + 50
-    draw_lines(bf, bl, bs, y, "white")
-    if not photo:
-        lf, ll, ls = block(label, 44, 900, 140)
-        draw_lines(lf, ll, ls, 190, (255, 255, 255, 170))
-    d.rounded_rectangle((160, H - 260, 920, H - 250), 5, fill=(255, 255, 255, 70))
-    d.rounded_rectangle((160, H - 260, 160 + 760 * (n + 1) / total, H - 250), 5, fill="#fde047")
+    f, lines, cur = ImageFont.truetype(fp, 46), [], ""
+    for w in text.split():
+        tst = (cur + " " + w).strip()
+        if f.getlength(tst) <= 900: cur = tst
+        else: lines.append(cur); cur = w
+    lines = [l for l in lines + [cur] if l]
+    y = H - 330 - len(lines) * 60
+    for l in lines:
+        d.text(((W - f.getlength(l)) / 2, y), l, font=f, fill="white", stroke_width=3, stroke_fill="black")
+        y += 60
+    d.rounded_rectangle((160, H - 260, 920, H - 254), 3, fill=(255, 255, 255, 60))
+    d.rounded_rectangle((160, H - 260, 160 + 760 * (n + 1) / total, H - 254), 3, fill="#fde047")
     img.convert("RGB").save(path)
 
 async def render(i, d):
@@ -245,29 +277,31 @@ async def render(i, d):
                                                  stderr=asyncio.subprocess.DEVNULL)
         return await p.wait() == 0
 
-    segs, fails = [], 0
+    segs, fails, last = [], 0, None
     for n, s in enumerate(scenes):
         sd = dur * len(s["text"]) / total
-        png, seg, frames = f"videos/{i}_{n}.png", f"videos/{i}_{n}.mp4", max(2, round(sd * 30))
         photo = None
-        if s.get("image") and fails < 2:  # две неудачи подряд: дальше без картинок, графикой
-            try:
-                photo = f"videos/{i}_{n}.jpg"
-                await asyncio.to_thread(gen_image, f"{s['image']}, {d.get('style', '')}, cinematic, detailed, no text, no watermark",
-                                        photo, random.randint(1, 99999))
-                fails = 0
-            except Exception as e:
-                photo = None; fails += 1; log(f"Монтажёр: картинка к сцене {n+1} не создалась ({e}), рисую графику")
-        await asyncio.to_thread(scene_png, s["text"], s.get("headline", ""), d["title"], n, len(scenes), png, photo)
+        if fails < 2:  # если картинки два раза подряд не получились, дальше повторяем последнюю
+            photo = await get_image(f"videos/{i}_{n}.jpg", s, d)
+            fails = 0 if photo else fails + 1
+        photo = photo or last
+        last = photo or last
+        parts = chunks(s["text"])
+        tot_frames, off = max(2, round(sd * 30)), 0
         z0, z1 = (1.0, 1.12) if n % 2 == 0 else (1.12, 1.0)  # плавное приближение / отдаление
-        zoom = (f"scale=1620:2880,zoompan=z='{z0}+({z1}-{z0})*on/{frames}':x='iw/2-(iw/zoom/2)':"
-                f"y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30,fade=t=in:st=0:d=0.2,format=yuv420p")
-        ok = await run("-i", png, "-vf", zoom, "-t", f"{sd:.2f}", "-c:v", "libx264", "-preset", "veryfast", seg)
-        if not ok:  # запасной вариант без движения
-            ok = await run("-loop", "1", "-i", png, "-t", f"{sd:.2f}", "-vf", "scale=1080:1920,fps=30,format=yuv420p",
-                           "-c:v", "libx264", "-preset", "veryfast", seg)
-        if not ok: raise RuntimeError("ffmpeg не смог собрать сцену")
-        segs.append(Path(seg).name)
+        for k, ch in enumerate(parts):
+            cd = sd * len(ch) / sum(len(c) for c in parts)
+            frames = max(2, round(cd * 30))
+            png, seg = f"videos/{i}_{n}_{k}.png", f"videos/{i}_{n}_{k}.mp4"
+            await asyncio.to_thread(scene_png, ch, n, len(scenes), png, photo)
+            zoom = (f"scale=1620:2880,zoompan=z='{z0}+({z1}-{z0})*(on+{off})/{tot_frames}':x='iw/2-(iw/zoom/2)':"
+                    f"y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30,format=yuv420p")
+            ok = await run("-i", png, "-vf", zoom, "-t", f"{cd:.2f}", "-c:v", "libx264", "-preset", "veryfast", seg)
+            if not ok:  # запасной вариант без движения
+                ok = await run("-loop", "1", "-i", png, "-t", f"{cd:.2f}", "-vf", "scale=1080:1920,fps=30,format=yuv420p",
+                               "-c:v", "libx264", "-preset", "veryfast", seg)
+            if not ok: raise RuntimeError("ffmpeg не смог собрать сцену")
+            segs.append(Path(seg).name); off += frames
     lst = f"videos/{i}_list.txt"
     Path(lst).write_text("".join(f"file '{x}'\n" for x in segs))
     if not await run("-f", "concat", "-safe", "0", "-i", lst, "-i", mp3, "-map", "0:v", "-map", "1:a",
@@ -397,16 +431,20 @@ class Settings(BaseModel):
     voice: str
     privacy: str
     hit_views: int
+    replicate_key: str = ""
+    pixabay_key: str = ""
 
 @app.get("/api/settings")
 def get_settings():
-    return {**{k: v for k, v in CFG.items() if k != "api_key"}, "has_key": bool(KEY),
+    return {**{k: v for k, v in CFG.items() if k not in ("api_key", "replicate_key", "pixabay_key")}, "has_key": bool(KEY), "has_replicate": bool(REPLICATE), "has_pixabay": bool(PIXABAY),
             "has_client": os.path.exists("client_secret.json"), "has_token": os.path.exists("token.json")}
 
 @app.post("/api/settings")
 def set_settings(s: Settings):
     new = s.model_dump()
     if not new["api_key"]: new["api_key"] = KEY
+    if not new["replicate_key"]: new["replicate_key"] = REPLICATE
+    if not new["pixabay_key"]: new["pixabay_key"] = PIXABAY
     SF.write_text(json.dumps(new, ensure_ascii=False), "utf-8"); apply_settings(new)
     return {"ok": True}
 
