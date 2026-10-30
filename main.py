@@ -21,7 +21,7 @@ MODEL, MAX_PENDING, STATS_EVERY = "claude-sonnet-5-5", 2, 3600
 SF = Path("settings.json")
 DEFAULTS = {"api_key": "", "niche": "интересные факты", "lang": "русский",
             "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000,
-            "writer_rules": "", "editor_rules": "", "character": ""}
+            "writer_rules": "", "editor_rules": "", "analyst_rules": "", "visual_mode": "illustrations", "motion": "dynamic", "character": ""}
 
 def apply_settings(s=None):
     global CFG, KEY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
@@ -435,6 +435,40 @@ def sub_overlay(text, n, total):
     d.rounded_rectangle((160, h - 260, 160 + 760 * (n + 1) / total, h - 254), 3, fill="#fde047")
     return ov
 
+def illustration_frames(i, n, parts, total, nframes):
+    """Render locally supplied full-frame illustrations with cinematic pans and captions.
+
+    Source: visuals/<video_id>/<scene_number>.png|jpg|webp, 1-based scene numbering.
+    Never calls paid image/video APIs and never silently falls back to Paint graphics.
+    """
+    from PIL import Image, ImageEnhance
+    folder = Path("visuals") / str(i)
+    source = next((folder / f"{n+1}.{ext}" for ext in ("png", "jpg", "jpeg", "webp")
+                   if (folder / f"{n+1}.{ext}").is_file()), None)
+    if source is None:
+        raise RuntimeError(f"Нет иллюстрации сцены {n+1}: добавьте файл visuals/{i}/{n+1}.png (или jpg/webp). "
+                           "Режим 'Иллюстрации' не рисует примитивные фигуры автоматически.")
+    with Image.open(source) as im:
+        original = im.convert("RGB")
+    original = ImageEnhance.Contrast(original).enhance(1.04)
+    acc, bounds, count = 0, [], max(1, sum(len(c) for c in parts))
+    for c in parts:
+        acc += len(c)
+        bounds.append((acc / count, sub_overlay(c, n, total)))
+    for f in range(nframes):
+        t = f / max(1, nframes - 1)
+        # Pan horizontally/vertically, without repetitive zoom-in/zoom-out.
+        scale = max(W / original.width, H / original.height) * 1.12
+        iw, ih = math.ceil(original.width * scale), math.ceil(original.height * scale)
+        im = original.resize((iw, ih), Image.Resampling.LANCZOS)
+        dx, dy = iw - W, ih - H
+        x = int(dx * ((0.1 + 0.8 * ease(t)) if n % 2 else (0.9 - 0.8 * ease(t))))
+        y = int(dy * (0.3 + 0.4 * ease(t)))
+        fr = im.crop((x, y, x + W, y + H)).convert("RGBA")
+        ov = next((o for b, o in bounds if t < b), bounds[-1][1])
+        fr.paste(ov, (0, H - ov.height), ov)
+        fr.convert("RGB").save(f"videos/{i}_{n}_{f:04d}.jpg", quality=88)
+
 def scene_frames(i, n, stage, cast, parts, total, nframes):
     """Рисует все кадры сцены: фон, актёры с движением частей, частицы, камера и субтитры."""
     bg, actors = render_bg(stage), build_actors(stage, cast)
@@ -468,9 +502,10 @@ async def render(i, d):
             except Exception as e: log(f"Монтажёр: {what} не получилось ({e})")
         return None
 
+    illustration_mode = CFG.get("visual_mode", "illustrations") == "illustrations"
     host = next((c["asset"] for c in load_chars() if c["id"] == CFG.get("character")), None)
     setag("editor", "working", "Придумывает персонажей")
-    plan = await retry(plan_cast, "план персонажей", d, bool(host))
+    plan = None if illustration_mode else await retry(plan_cast, "план персонажей", d, bool(host))
     sem, cast, palette = asyncio.Semaphore(3), [], []
     if plan:
         palette = plan.get("palette", [])
@@ -478,21 +513,24 @@ async def render(i, d):
             async with sem: return await retry(draw_asset, f"рисунок «{item.get('id')}»", item, plan, d)
         setag("editor", "working", "Рисует персонажей и предметы")
         cast = [a for a in await asyncio.gather(*(one(it) for it in plan["assets"][:8])) if a]
-    if host: cast.append({**host, "id": "host"})
+    if host and not illustration_mode: cast.append({**host, "id": "host"})
 
     async def stage(s):
         async with sem:
             return await retry(make_stage, "постановка кадра", s, d, cast, palette, bool(host)) if cast else None
 
     setag("editor", "working", "Ставит кадры")
-    stages = await asyncio.gather(*(stage(s) for s in scenes))
+    stages = [None] * len(scenes) if illustration_mode else await asyncio.gather(*(stage(s) for s in scenes))
     segs, last = [], None
     for n, s in enumerate(scenes):
         setag("editor", "working", f"Анимирует сцену {n+1} из {len(scenes)}")
         st = stages[n] or last  # если кадр не поставился, берём предыдущий
         last = st or last
         nframes = max(2, round(dur * len(s["text"]) / total * FPS))
-        await asyncio.to_thread(scene_frames, i, n, st, cast, chunks(s["text"]), len(scenes), nframes)
+        if illustration_mode:
+            await asyncio.to_thread(illustration_frames, i, n, chunks(s["text"]), len(scenes), nframes)
+        else:
+            await asyncio.to_thread(scene_frames, i, n, st, cast, chunks(s["text"]), len(scenes), nframes)
         seg = f"videos/{i}_{n}.mp4"
         if not await run("-framerate", str(FPS), "-i", f"videos/{i}_{n}_%04d.jpg", "-vf", "format=yuv420p",
                          "-c:v", "libx264", "-preset", "veryfast", seg):
@@ -560,6 +598,7 @@ async def analyst_loop():
                 hit = [f"«{r['title']}» ({r['views']})" for r in rows if r["views"] >= HIT_VIEWS][:3]
                 miss = [f"«{r['title']}» ({r['views']})" for r in rows if r["views"] < HIT_VIEWS][-3:]
                 INSIGHTS = f"Залетели: {', '.join(hit) or 'нет'}. Не зашли: {', '.join(miss) or 'нет'}. Делай больше похожего на залетевшее."
+                INSIGHTS += "\nДополнительные правила аналитика: " + CFG.get("analyst_rules", "")
                 log("Аналитик: отчёт передан сценаристу")
             except Exception as e:
                 log(f"Аналитик: ошибка {e}")
@@ -679,6 +718,9 @@ class Settings(BaseModel):
     hit_views: int
     writer_rules: str = ""
     editor_rules: str = ""
+    analyst_rules: str = ""
+    visual_mode: str = "illustrations"
+    motion: str = "dynamic"
 
 @app.get("/api/settings")
 def get_settings():
