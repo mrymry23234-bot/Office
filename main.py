@@ -1,5 +1,5 @@
 """AI-офис для YouTube Shorts: сценарист -> (вы) -> монтажёр/публикатор -> (вы) -> аналитик -> сценарист."""
-import asyncio, glob, json, math, os, random, re, sqlite3, subprocess, sys, threading, time
+import asyncio, base64, glob, json, math, os, random, re, sqlite3, subprocess, sys, threading, time, urllib.request, urllib.parse, uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -21,7 +21,7 @@ MODEL, MAX_PENDING, STATS_EVERY = "claude-sonnet-5-5", 2, 3600
 SF = Path("settings.json")
 DEFAULTS = {"api_key": "", "niche": "интересные факты", "lang": "русский",
             "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000,
-            "writer_rules": "", "editor_rules": "", "analyst_rules": "", "visual_mode": "illustrations", "motion": "dynamic", "character": ""}
+            "writer_rules": "", "editor_rules": "", "analyst_rules": "", "visual_mode": "comfy", "motion": "dynamic", "character": "", "comfy_url": "http://127.0.0.1:8188", "comfy_checkpoint": "", "image_steps": 20}
 
 def apply_settings(s=None):
     global CFG, KEY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
@@ -437,6 +437,75 @@ def sub_overlay(text, n, total):
     d.rounded_rectangle((160, h - 260, 160 + 760 * (n + 1) / total, h - 254), 3, fill="#fde047")
     return ov
 
+def comfy_json(url, endpoint, payload=None, timeout=15):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url.rstrip("/") + endpoint, data=data,
+        headers={"Content-Type": "application/json"} if data else {}, method="POST" if data else "GET")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read())
+
+
+def comfy_checkpoints(url):
+    data = comfy_json(url, "/object_info/CheckpointLoaderSimple")
+    return data["CheckpointLoaderSimple"]["input"]["required"]["ckpt_name"][0]
+
+
+def generate_comfy_scene(item_id, scene_index, scene, script):
+    """Generate a reproducible scene image using the user's local ComfyUI server.
+    A missing backend/model is an actionable error; never silently render Paint shapes.
+    """
+    url = CFG.get("comfy_url", "http://127.0.0.1:8188").rstrip("/")
+    folder = Path("visuals") / str(item_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"{scene_index+1}.png"
+    if target.exists():
+        return target  # Resume does not pay/recompute already generated frames.
+    try:
+        models = comfy_checkpoints(url)
+    except Exception as exc:
+        raise RuntimeError("ComfyUI недоступен. Запустите ComfyUI на компьютере и проверьте адрес в настройках. " + str(exc)) from exc
+    checkpoint = CFG.get("comfy_checkpoint", "").strip() or (models[0] if models else "")
+    if checkpoint not in models:
+        raise RuntimeError("В ComfyUI нет выбранной модели (checkpoint). Установите модель в ComfyUI/models/checkpoints и перезапустите ComfyUI.")
+    style = script.get("style", "colorful high quality 2D animated movie")
+    chars = ", ".join(str(x) for x in script.get("characters", [])[:5])
+    prompt = (f"Beautiful professional 2D animated film still, cohesive character design, "
+              f"{style}. {scene.get('image', scene.get('text', ''))}. "
+              f"Recurring characters: {chars}. Strong composition, appealing lighting, "
+              "rich background, cinematic storytelling, portrait 9:16, no letters, no text, no watermark")
+    negative = "low quality, crude geometry, stick figures, paint drawing, watermark, text, letters, blurry, deformed"
+    seed = (item_id * 1000003 + scene_index * 7919) % (2**63-1)
+    workflow = {
+      "1":{"class_type":"CheckpointLoaderSimple","inputs":{"ckpt_name":checkpoint}},
+      "2":{"class_type":"CLIPTextEncode","inputs":{"text":prompt,"clip":["1",1]}},
+      "3":{"class_type":"CLIPTextEncode","inputs":{"text":negative,"clip":["1",1]}},
+      "4":{"class_type":"EmptyLatentImage","inputs":{"width":576,"height":1024,"batch_size":1}},
+      "5":{"class_type":"KSampler","inputs":{"seed":seed,"steps":max(8,min(40,int(CFG.get("image_steps",20)))),"cfg":7.0,"sampler_name":"euler","scheduler":"normal","denoise":1.0,"model":["1",0],"positive":["2",0],"negative":["3",0],"latent_image":["4",0]}},
+      "6":{"class_type":"VAEDecode","inputs":{"samples":["5",0],"vae":["1",2]}},
+      "7":{"class_type":"SaveImage","inputs":{"filename_prefix":f"AIOffice_{item_id}_{scene_index}","images":["6",0]}}
+    }
+    job = comfy_json(url,"/prompt",{"prompt":workflow,"client_id":str(uuid.uuid4())},timeout=30)
+    prompt_id = job["prompt_id"]
+    for _ in range(180):
+        time.sleep(2)
+        history = comfy_json(url,"/history/"+urllib.parse.quote(prompt_id),timeout=20)
+        if prompt_id not in history:
+            continue
+        record = history[prompt_id]
+        if record.get("status",{}).get("status_str") == "error":
+            raise RuntimeError("ComfyUI: генерация завершилась ошибкой. Проверьте журнал ComfyUI и доступную видеопамять.")
+        outputs = record.get("outputs",{}).get("7",{}).get("images",[])
+        if outputs:
+            img = outputs[0]
+            query = urllib.parse.urlencode({"filename":img["filename"],"subfolder":img.get("subfolder", ""),"type":img.get("type","output")})
+            with urllib.request.urlopen(url+"/view?"+query,timeout=60) as response:
+                target.write_bytes(response.read())
+            from PIL import Image
+            with Image.open(target) as im: im.verify()
+            return target
+    raise RuntimeError("ComfyUI не завершил генерацию за 6 минут. Сценарий сохранён, можно повторить монтаж.")
+
+
 def illustration_frames(i, n, parts, total, nframes):
     """Render locally supplied full-frame illustrations with cinematic pans and captions.
 
@@ -504,10 +573,27 @@ async def render(i, d):
             except Exception as e: log(f"Монтажёр: {what} не получилось ({e})")
         return None
 
-    illustration_mode = CFG.get("visual_mode", "illustrations") == "illustrations"
+    visual_mode = CFG.get("visual_mode", "auto")
+    comfy_mode = visual_mode == "comfy"
+    illustration_mode = visual_mode == "illustrations"
+    auto_mode = visual_mode == "auto"
+    def has_image(n):
+        folder = Path("visuals") / str(i)
+        return any((folder / f"{n+1}.{ext}").is_file() for ext in ("png", "jpg", "jpeg", "webp"))
+    missing = [n for n in range(len(scenes)) if not has_image(n)]
+    # Auto mode never requires the user to supply visuals; it falls back to
+    # the built-in procedural renderer until a local image model is connected.
+    need_procedural = not (illustration_mode or comfy_mode) and (not auto_mode or bool(missing))
+    if comfy_mode and missing:
+        setag("editor", "working", "Генерирует мультяшные иллюстрации через ComfyUI")
+        for n in missing:
+            setag("editor", "working", f"Генерирует иллюстрацию {n+1} из {len(scenes)}")
+            await asyncio.to_thread(generate_comfy_scene, i, n, scenes[n], d)
+    if auto_mode and missing:
+        log(f"Монтажёр: нет изображений для {len(missing)} сцен; использую встроенную графику. Это временный режим, не AI-анимация.")
     host = next((c["asset"] for c in load_chars() if c["id"] == CFG.get("character")), None)
     setag("editor", "working", "Придумывает персонажей")
-    plan = None if illustration_mode else await retry(plan_cast, "план персонажей", d, bool(host))
+    plan = await retry(plan_cast, "план персонажей", d, bool(host)) if need_procedural else None
     sem, cast, palette = asyncio.Semaphore(3), [], []
     if plan:
         palette = plan.get("palette", [])
@@ -515,21 +601,21 @@ async def render(i, d):
             async with sem: return await retry(draw_asset, f"рисунок «{item.get('id')}»", item, plan, d)
         setag("editor", "working", "Рисует персонажей и предметы")
         cast = [a for a in await asyncio.gather(*(one(it) for it in plan["assets"][:8])) if a]
-    if host and not illustration_mode: cast.append({**host, "id": "host"})
+    if host and need_procedural: cast.append({**host, "id": "host"})
 
     async def stage(s):
         async with sem:
             return await retry(make_stage, "постановка кадра", s, d, cast, palette, bool(host)) if cast else None
 
     setag("editor", "working", "Ставит кадры")
-    stages = [None] * len(scenes) if illustration_mode else await asyncio.gather(*(stage(s) for s in scenes))
+    stages = await asyncio.gather(*(stage(s) for s in scenes)) if need_procedural else [None] * len(scenes)
     segs, last = [], None
     for n, s in enumerate(scenes):
         setag("editor", "working", f"Анимирует сцену {n+1} из {len(scenes)}")
         st = stages[n] or last  # если кадр не поставился, берём предыдущий
         last = st or last
         nframes = max(2, round(dur * len(s["text"]) / total * FPS))
-        if illustration_mode:
+        if illustration_mode or comfy_mode or (auto_mode and has_image(n)):
             await asyncio.to_thread(illustration_frames, i, n, chunks(s["text"]), len(scenes), nframes)
         else:
             await asyncio.to_thread(scene_frames, i, n, st, cast, chunks(s["text"]), len(scenes), nframes)
@@ -660,6 +746,22 @@ def retry_render(item_id: int):
     q("update items set status='script_approved' where id=? and status='render_failed'", item_id)
     return {"ok": True, "message": "Сценарий сохранён и снова передан монтажёру"}
 
+@app.post("/api/delete_failed/{item_id}")
+def delete_failed(item_id: int):
+    # Only failed renders are deletable here. Never delete an approved,
+    # currently rendering, published or pending video accidentally.
+    with lock:
+        row = db.execute("select status from items where id=?", (item_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Сценарий не найден")
+        if row["status"] != "render_failed":
+            raise HTTPException(409, "Удалять можно только сценарии с ошибкой монтажа")
+        db.execute("delete from item_errors where item_id=?", (item_id,))
+        db.execute("delete from items where id=? and status='render_failed'", (item_id,))
+        db.commit()
+    log(f"Сценарий #{item_id} удалён пользователем")
+    return {"ok": True}
+
 @app.get("/api/voice_test")
 async def voice_test(voice: str):
     if not re.fullmatch(r"[a-z]{2}-[A-Z]{2}-\w+Neural", voice): raise HTTPException(400)
@@ -736,7 +838,10 @@ class Settings(BaseModel):
     writer_rules: str = ""
     editor_rules: str = ""
     analyst_rules: str = ""
-    visual_mode: str = "illustrations"
+    visual_mode: str = "comfy"
+    comfy_url: str = "http://127.0.0.1:8188"
+    comfy_checkpoint: str = ""
+    image_steps: int = 20
     motion: str = "dynamic"
 
 @app.get("/api/settings")
@@ -751,6 +856,14 @@ def set_settings(s: Settings):
     new["character"] = CFG.get("character", "")
     SF.write_text(json.dumps(new, ensure_ascii=False), "utf-8"); apply_settings(new)
     return {"ok": True}
+
+@app.get("/api/comfy_status")
+def comfy_status():
+    try:
+        models = comfy_checkpoints(CFG.get("comfy_url", "http://127.0.0.1:8188"))
+        return {"ok": bool(models), "models": models, "message": "Готов к генерации" if models else "Не установлены модели"}
+    except Exception as exc:
+        return {"ok": False, "models": [], "message": str(exc)}
 
 @app.post("/api/client_secret")
 def client_secret(body: dict):
