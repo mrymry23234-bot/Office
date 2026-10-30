@@ -39,6 +39,8 @@ db = sqlite3.connect("office.db", check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.execute("""create table if not exists items(id integer primary key, status text, title text,
               data text, video text, yt_id text, views integer default 0)""")
+db.execute("""create table if not exists item_errors(item_id integer primary key, message text, updated_at text default current_timestamp)""")
+db.commit()
 lock = threading.Lock()
 
 def q(sql, *a):
@@ -554,9 +556,12 @@ async def editor_loop():
             try:
                 path = await render(r["id"], json.loads(r["data"]))
                 q("update items set status='video_pending', video=? where id=?", path, r["id"])
+                q("delete from item_errors where item_id=?", r["id"])
                 log("Монтажёр: видео готово «" + r["title"] + "»")
             except Exception as e:
-                q("update items set status='render_failed' where id=?", r["id"]); log(f"Монтажёр: ошибка {e}")
+                q("update items set status='render_failed' where id=?", r["id"])
+                q("insert into item_errors(item_id,message,updated_at) values(?,?,current_timestamp) on conflict(item_id) do update set message=excluded.message,updated_at=current_timestamp", r["id"], str(e))
+                log(f"Монтажёр: ошибка {e}. Сценарий сохранён; исправьте проблему и нажмите «Повторить монтаж».")
             continue
         r = q("select * from items where status='video_revise' limit 1")
         if r:
@@ -608,6 +613,8 @@ async def analyst_loop():
 # ---- API и запуск ----
 @asynccontextmanager
 async def lifespan(_):
+    # A terminated application must not strand an approved script in 'rendering'.
+    q("update items set status='render_failed' where status='rendering'")
     for f in (writer_loop, editor_loop, analyst_loop): asyncio.create_task(f())
     yield
 
@@ -623,8 +630,10 @@ def state():
     rows = q("select id,status,title,data,views from items order by id desc")
     return {"agents": AG, "log": LOG[:30],
             "pending": [{"id": r["id"], "kind": r["status"], "title": r["title"],
-                         "text": json.loads(r["data"])["narration"]}
-                        for r in rows if r["status"] in ("script_pending", "video_pending")],
+                         "text": json.loads(r["data"]).get("narration", ""),
+                         "error": (q("select message from item_errors where item_id=?", r["id"])[0]["message"]
+                                   if r["status"] == "render_failed" and q("select message from item_errors where item_id=?", r["id"]) else "")}
+                        for r in rows if r["status"] in ("script_pending", "video_pending", "render_failed")],
             "videos": [{"title": r["title"], "views": r["views"], "hit": r["views"] >= HIT_VIEWS}
                        for r in rows if r["status"] == "published"]}
 
@@ -642,6 +651,14 @@ def decide(d: Decision):
            "video_pending": ("video_approved", "video_rejected")}.get(st)
     if nxt: q("update items set status=? where id=?", nxt[0 if d.ok else 1], d.id)
     return {"ok": True}
+
+@app.post("/api/retry_render/{item_id}")
+def retry_render(item_id: int):
+    row = q("select status from items where id=?", item_id)
+    if not row or row[0]["status"] != "render_failed":
+        raise HTTPException(409, "Задание не находится в состоянии ошибки монтажа")
+    q("update items set status='script_approved' where id=? and status='render_failed'", item_id)
+    return {"ok": True, "message": "Сценарий сохранён и снова передан монтажёру"}
 
 @app.get("/api/voice_test")
 async def voice_test(voice: str):

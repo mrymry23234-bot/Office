@@ -80,13 +80,15 @@ async function tick(){
    <div class="st">${L[s.s]}</div><div class="task">${esc(s.t)}</div></div>`}).join("");
   const rs=JSON.stringify(d.pending);
   if(rs!==sig){sig=rs;
-   $("reqs").innerHTML=d.pending.length?d.pending.map(r=>`<div class="req"><b>${r.kind==="script_pending"?"Сценарий":"Опубликовать видео?"}: ${esc(r.title)}</b>
+   $("reqs").innerHTML=d.pending.length?d.pending.map(r=>`<div class="req"><b>${r.kind==="script_pending"?"Сценарий":r.kind==="render_failed"?"Ошибка монтажа — сценарий сохранён":"Опубликовать видео?"}: ${esc(r.title)}</b>
     ${r.kind==="video_pending"?`<video src="/media/${r.id}" controls></video>`:""}<p>${esc(r.text)}</p>
-    <textarea id="n${r.id}" placeholder="Что переделать? Например: сделай сцены короче, замени картинку про пирамиды…"></textarea><button class="y" onclick="decide(${r.id},true)">Одобрить</button><button class="e" onclick="revise(${r.id})">Доработать</button><button class="n" onclick="decide(${r.id},false)">Отклонить</button></div>`).join(""):'<div class="empty">Пока ничего не ждёт одобрения.</div>';}
+    ${r.kind==="render_failed"?`<p style="color:#f99;white-space:pre-wrap">${esc(r.error||"Монтаж прерван")}</p><button class="y" onclick="retryRender(${r.id})">↻ Повторить монтаж</button>`:""}
+    ${r.kind==="render_failed"?"":`<textarea id="n${r.id}" placeholder="Что переделать? Например: сделай сцены короче, замени картинку про пирамиды…"></textarea><button class="y" onclick="decide(${r.id},true)">Одобрить</button><button class="e" onclick="revise(${r.id})">Доработать</button><button class="n" onclick="decide(${r.id},false)">Отклонить</button>`}</div>`).join(""):'<div class="empty">Пока ничего не ждёт одобрения.</div>';}
   $("vids").innerHTML=d.videos.length?d.videos.map(v=>`<div class="vid"><span>${esc(v.title)}</span><span class="${v.hit?"hit":""}">${v.hit?"🔥 ":""}${v.views}</span></div>`).join(""):'<div class="empty">Опубликованных видео пока нет.</div>';
   $("log").innerHTML=d.log.map(l=>`<div>${esc(l)}</div>`).join("");
  }catch(e){}
 }
+async function retryRender(id){const r=await post("/api/retry_render/"+id,{});if(!r.ok)alert(r.detail||"Не удалось повторить монтаж");sig="";tick()}
 async function revise(id){const t=$("n"+id).value.trim();if(!t){alert("Напишите, что нужно изменить");return}await post("/api/decide",{id,ok:false,revise:t});sig="";tick()}
 function testVoice(){const a=new Audio("/api/voice_test?voice="+encodeURIComponent($("s_voice").value));a.onerror=()=>alert("Этот голос сейчас недоступен. Выберите другой.");a.play().catch(()=>{})}
 async function decide(id,ok){await fetch("/api/decide",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,ok})});sig="";tick()}
