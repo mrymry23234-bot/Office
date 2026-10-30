@@ -450,14 +450,14 @@ def comfy_checkpoints(url):
     return data["CheckpointLoaderSimple"]["input"]["required"]["ckpt_name"][0]
 
 
-def generate_comfy_scene(item_id, scene_index, scene, script):
+def generate_comfy_scene(item_id, scene_index, scene, script, layer="scene"):
     """Generate a reproducible scene image using the user's local ComfyUI server.
     A missing backend/model is an actionable error; never silently render Paint shapes.
     """
     url = CFG.get("comfy_url", "http://127.0.0.1:8188").rstrip("/")
     folder = Path("visuals") / str(item_id)
     folder.mkdir(parents=True, exist_ok=True)
-    target = folder / f"{scene_index+1}.png"
+    target = folder / (f"{scene_index+1}.png" if layer == "scene" else f"{scene_index+1}_{layer}.png")
     if target.exists():
         try:
             from PIL import Image
@@ -479,8 +479,18 @@ def generate_comfy_scene(item_id, scene_index, scene, script):
               f"{style}. {scene.get('image', scene.get('text', ''))}. "
               f"Recurring characters: {chars}. Strong composition, appealing lighting, "
               "rich background, cinematic storytelling, portrait 9:16, no letters, no text, no watermark")
+    if layer == "background":
+        prompt = (f"Beautiful detailed animated film environment background, {style}. "
+                  f"Setting from story: {scene.get('image', scene.get('text',''))}. "
+                  "EMPTY SCENE, NO CHARACTERS, NO ANIMALS, NO PEOPLE, no text, portrait composition")
+    elif layer == "actor":
+        prompt = (f"One single full body cartoon character, {chars or scene.get('image','friendly animal')}. "
+                  f"{style}. Standing upright, front three-quarter view, arms and legs clearly visible, "
+                  "EXACTLY TWO ARMS AND TWO LEGS, one head, one torso, simple clothing, "
+                  "entire body within frame, plain bright solid green (#00FF00) background, "
+                  "no plants, no props, no shadows, no additional characters, no text")
     negative = "low quality, crude geometry, stick figures, paint drawing, watermark, text, letters, blurry, deformed"
-    seed = (item_id * 1000003 + scene_index * 7919) % (2**63-1)
+    seed = (item_id * 1000003 + scene_index * 7919 + {"scene":0,"background":11,"actor":23}.get(layer,0)) % (2**63-1)
     # SDXL Turbo uses very low step counts and CFG=1; ordinary SDXL uses more steps.
     turbo = "turbo" in checkpoint.lower()
     steps = max(1, min(4, int(CFG.get("image_steps", 2)))) if turbo else max(8, min(40, int(CFG.get("image_steps", 20))))
@@ -493,7 +503,7 @@ def generate_comfy_scene(item_id, scene_index, scene, script):
       "4":{"class_type":"EmptyLatentImage","inputs":{"width":576,"height":1024,"batch_size":1}},
       "5":{"class_type":"KSampler","inputs":{"seed":seed,"steps":steps,"cfg":cfg_scale,"sampler_name":sampler,"scheduler":"normal","denoise":1.0,"model":["1",0],"positive":["2",0],"negative":["3",0],"latent_image":["4",0]}},
       "6":{"class_type":"VAEDecode","inputs":{"samples":["5",0],"vae":["1",2]}},
-      "7":{"class_type":"SaveImage","inputs":{"filename_prefix":f"AIOffice_{item_id}_{scene_index}","images":["6",0]}}
+      "7":{"class_type":"SaveImage","inputs":{"filename_prefix":f"AIOffice_{item_id}_{scene_index}_{layer}","images":["6",0]}}
     }
     job = comfy_json(url,"/prompt",{"prompt":workflow,"client_id":str(uuid.uuid4())},timeout=30)
     prompt_id = job["prompt_id"]
@@ -551,6 +561,53 @@ def illustration_frames(i, n, parts, total, nframes):
         fr.paste(ov, (0, H - ov.height), ov)
         fr.convert("RGB").save(f"videos/{i}_{n}_{f:04d}.jpg", quality=88)
 
+def layered_frames(i, n, parts, total, nframes):
+    """Two independently animated image layers. This is NOT skeletal animation.
+
+    Actor extraction uses a green-screen heuristic. If the matte is unreliable,
+    it raises an actionable error rather than silently producing a broken video.
+    """
+    from PIL import Image, ImageEnhance, ImageFilter
+    folder = Path("visuals") / str(i)
+    bg_path, actor_path = folder / f"{n+1}_background.png", folder / f"{n+1}_actor.png"
+    with Image.open(bg_path) as im: bg = im.convert("RGB")
+    with Image.open(actor_path) as im: actor = im.convert("RGB")
+    # Simple chroma-key: remove green where green strongly dominates red/blue.
+    # A purpose-built segmentation model will be needed for reliable hair/fur edges.
+    small = actor.resize((384, 672), Image.Resampling.LANCZOS)
+    alpha = Image.new("L", small.size)
+    alpha.putdata([0 if g > r*1.25 and g > b*1.20 and g > 85 else 255 for r,g,b in small.getdata()])
+    alpha = alpha.filter(ImageFilter.GaussianBlur(1.2))
+    if not (0.06 < sum(1 for v in alpha.resize((48,84)).getdata() if v > 127)/(48*84) < 0.82):
+        raise RuntimeError("Не удалось отделить персонажа от фона. Повторите генерацию персонажа с однотонным зелёным фоном.")
+    sprite = small.convert("RGBA"); sprite.putalpha(alpha)
+    bbox = alpha.getbbox()
+    if not bbox: raise RuntimeError("Персонаж не выделен из фона")
+    sprite = sprite.crop(bbox)
+    scale = max(W/bg.width, H/bg.height)*1.05
+    bg = bg.resize((math.ceil(bg.width*scale), math.ceil(bg.height*scale)),Image.Resampling.LANCZOS)
+    target_h = int(H*.64)
+    target_w = max(1,int(sprite.width*target_h/sprite.height))
+    sprite = sprite.resize((target_w,target_h),Image.Resampling.LANCZOS)
+    acc,bounds,count=0,[],max(1,sum(len(c) for c in parts))
+    for c in parts:
+        acc+=len(c);bounds.append((acc/count,sub_overlay(c,n,total)))
+    for f in range(nframes):
+        t=f/max(1,nframes-1)
+        drift=ease(t)-.5
+        dx=max(0,bg.width-W);dy=max(0,bg.height-H)
+        x=int(dx*(.5+.35*drift));y=int(dy*(.5+.2*drift))
+        fr=bg.crop((x,y,x+W,y+H)).convert("RGBA")
+        angle=2.2*math.sin(2*math.pi*(1.2*t+n*.3))
+        posed=sprite.rotate(angle,Image.Resampling.BICUBIC,expand=True)
+        sx=int((W-posed.width)/2+W*.10*math.sin(math.pi*2*t*.7))
+        sy=int(H*.27+H*.012*math.sin(2*math.pi*2*t))
+        fr.alpha_composite(posed,(sx,sy))
+        ov=next((o for b,o in bounds if t<b),bounds[-1][1])
+        fr.paste(ov,(0,H-ov.height),ov)
+        fr.convert("RGB").save(f"videos/{i}_{n}_{f:04d}.jpg",quality=88)
+
+
 def scene_frames(i, n, stage, cast, parts, total, nframes):
     """Рисует все кадры сцены: фон, актёры с движением частей, частицы, камера и субтитры."""
     bg, actors = render_bg(stage), build_actors(stage, cast)
@@ -585,13 +642,14 @@ async def render(i, d):
         return None
 
     visual_mode = CFG.get("visual_mode", "auto")
-    comfy_mode = visual_mode == "comfy"
+    comfy_mode = visual_mode in ("comfy", "comfy_layers")
+    layered_mode = visual_mode == "comfy_layers"
     illustration_mode = visual_mode == "illustrations"
     auto_mode = visual_mode == "auto"
     def has_image(n):
         folder = Path("visuals") / str(i)
         return any((folder / f"{n+1}.{ext}").is_file() for ext in ("png", "jpg", "jpeg", "webp"))
-    missing = [n for n in range(len(scenes)) if not has_image(n)]
+    missing = [n for n in range(len(scenes)) if not ((Path("visuals") / str(i) / f"{n+1}_background.png").exists() and (Path("visuals") / str(i) / f"{n+1}_actor.png").exists())] if layered_mode else [n for n in range(len(scenes)) if not has_image(n)]
     # Auto mode never requires the user to supply visuals; it falls back to
     # the built-in procedural renderer until a local image model is connected.
     need_procedural = not (illustration_mode or comfy_mode) and (not auto_mode or bool(missing))
@@ -599,7 +657,11 @@ async def render(i, d):
         setag("editor", "working", "Генерирует мультяшные иллюстрации через ComfyUI")
         for n in missing:
             setag("editor", "working", f"Генерирует иллюстрацию {n+1} из {len(scenes)}")
-            await asyncio.to_thread(generate_comfy_scene, i, n, scenes[n], d)
+            if layered_mode:
+                for layer in ("background", "actor"):
+                    await asyncio.to_thread(generate_comfy_scene, i, n, scenes[n], d, layer)
+            else:
+                await asyncio.to_thread(generate_comfy_scene, i, n, scenes[n], d)
     if auto_mode and missing:
         log(f"Монтажёр: нет изображений для {len(missing)} сцен; использую встроенную графику. Это временный режим, не AI-анимация.")
     host = next((c["asset"] for c in load_chars() if c["id"] == CFG.get("character")), None)
@@ -626,7 +688,9 @@ async def render(i, d):
         st = stages[n] or last  # если кадр не поставился, берём предыдущий
         last = st or last
         nframes = max(2, round(dur * len(s["text"]) / total * FPS))
-        if illustration_mode or comfy_mode or (auto_mode and has_image(n)):
+        if layered_mode:
+            await asyncio.to_thread(layered_frames, i, n, chunks(s["text"]), len(scenes), nframes)
+        elif illustration_mode or comfy_mode or (auto_mode and has_image(n)):
             await asyncio.to_thread(illustration_frames, i, n, chunks(s["text"]), len(scenes), nframes)
         else:
             await asyncio.to_thread(scene_frames, i, n, st, cast, chunks(s["text"]), len(scenes), nframes)
