@@ -1,0 +1,41 @@
+{
+  "1": {
+    "inputs": {
+      "text": "Привет! Сегодня мы отправимся в удивительное путешествие по космосу.",
+      "speaker": "Ryan",
+      "model_choice": "1.7B",
+      "device": "auto",
+      "precision": "bf16",
+      "language": "Russian",
+      "seed": 435261940993843,
+      "instruct": "",
+      "max_new_tokens": 2048,
+      "top_p": 0.8,
+      "top_k": 20,
+      "temperature": 1,
+      "repetition_penalty": 1.05,
+      "attention": "auto",
+      "unload_model_after_generate": true,
+      "custom_model_path": "",
+      "custom_speaker_name": ""
+    },
+    "class_type": "FB_Qwen3TTSCustomVoice",
+    "_meta": {
+      "title": "🎵 Qwen3-TTS CustomVoice"
+    }
+  },
+  "2": {
+    "inputs": {
+      "filename_prefix": "audio/ComfyUI",
+      "format": "flac",
+      "audio": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "SaveAudioAdvanced",
+    "_meta": {
+      "title": "Сохранить аудио (расширенно)"
+    }
+  }
+}

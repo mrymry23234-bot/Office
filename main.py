@@ -19,7 +19,7 @@ else:
 MODEL, MAX_PENDING, STATS_EVERY = "claude-sonnet-5-5", 2, 3600
 SF = Path("settings.json")
 DEFAULTS = {"api_key": "", "niche": "интересные факты", "lang": "русский",
-            "voice": "ru_RU", "piper_executable": "", "piper_models_dir": "voices", "privacy": "private", "hit_views": 1000,
+            "voice": "Ryan", "voice_engine": "comfy_qwen", "qwen_model": "0.6B", "piper_executable": "", "piper_models_dir": "voices", "privacy": "private", "hit_views": 1000,
             "writer_rules": "", "editor_rules": "", "analyst_rules": "", "visual_mode": "comfy", "motion": "dynamic", "character": "", "comfy_url": "http://127.0.0.1:8188", "comfy_checkpoint": "", "image_steps": 2, "writer_paused": False, "comfy_autostart": False, "comfy_launch_command": "", "video_workflow": "", "video_prompt_node": "140:131", "video_prompt_field": "prompt"}
 
 def apply_settings(s=None):
@@ -177,7 +177,7 @@ def resolve_voice(voice=None):
         raise RuntimeError("Локальный голос не установлен. Скопируйте .onnx и .onnx.json в папку voices и выберите голос")
     return matched["id"]
 
-async def tts(text, path, voice=None):
+async def piper_tts(text, path, voice=None):
     """Fully offline Piper synthesis. No network fallback."""
     text = re.sub(r"\s+", " ", text).strip()
     if not text: raise RuntimeError("Пустой текст озвучки")
@@ -195,6 +195,87 @@ async def tts(text, path, voice=None):
     if proc.returncode != 0 or not wav.is_file() or wav.stat().st_size == 0:
         raise RuntimeError("Piper не создал аудио: " + err.decode("utf-8", "replace")[-500:])
     return str(wav)
+
+
+# Qwen3-TTS: use the user's exported ComfyUI API graph, not a second TTS installation.
+QWEN_SPEAKERS = ("Ryan", "Aiden", "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ono_Anna", "Sohee")
+
+def qwen_tts_sync(text, path, voice=None):
+    import copy
+    import imageio_ffmpeg
+    graph_path = BASE / "voice_workflow_api.json"
+    if not graph_path.is_file():
+        raise RuntimeError("Не найден voice_workflow_api.json рядом с программой")
+    graph = copy.deepcopy(json.loads(graph_path.read_text("utf-8")))
+    nodes = [(nid, node) for nid, node in graph.items() if node.get("class_type") == "FB_Qwen3TTSCustomVoice"]
+    if len(nodes) != 1:
+        raise RuntimeError("В графе Qwen3-TTS должен быть ровно один узел CustomVoice")
+    nid, node = nodes[0]
+    node["inputs"]["text"] = text
+    node["inputs"]["speaker"] = voice or CFG.get("voice") or "Ryan"
+    node["inputs"]["seed"] = random.randrange(1, 2**48)
+    # 0.6B was the model confirmed working earlier; selectable via config later.
+    node["inputs"]["model_choice"] = CFG.get("qwen_model", "0.6B")
+    node["inputs"]["unload_model_after_generate"] = True
+    save_nodes = [n for n in graph.values() if n.get("class_type") == "SaveAudioAdvanced"]
+    if not save_nodes:
+        raise RuntimeError("В API графе отсутствует SaveAudioAdvanced")
+    for n in save_nodes:
+        n["inputs"]["filename_prefix"] = "audio/AIOffice_" + uuid.uuid4().hex[:12]
+    url = CFG.get("comfy_url", "http://127.0.0.1:8188").rstrip("/")
+    if not comfy_reachable():
+        if CFG.get("comfy_autostart"):
+            result = ensure_comfy_background()
+            if not result.get("ok"):
+                raise RuntimeError("Не удалось запустить ComfyUI: " + result.get("message", ""))
+        else:
+            raise RuntimeError("ComfyUI не запущен. Запустите ComfyUI или включите автозапуск в настройках")
+    job = comfy_json(url, "/prompt", {"prompt": graph, "client_id": str(uuid.uuid4())}, timeout=60)
+    if job.get("node_errors"):
+        raise RuntimeError("Ошибка графа Qwen3-TTS: " + str(job["node_errors"])[:600])
+    pid = job.get("prompt_id")
+    if not pid:
+        raise RuntimeError("ComfyUI не вернул ID задания озвучки: " + str(job)[:400])
+    for _ in range(300):
+        time.sleep(2)
+        hist = comfy_json(url, "/history/" + urllib.parse.quote(pid), timeout=30).get(pid)
+        if not hist:
+            continue
+        status = hist.get("status", {})
+        if status.get("status_str") == "error":
+            raise RuntimeError("Qwen3-TTS: " + str(status.get("messages", []))[-900:])
+        for output in hist.get("outputs", {}).values():
+            for key in ("audio", "audios"):
+                for entry in output.get(key, []):
+                    if not isinstance(entry, dict) or not entry.get("filename"):
+                        continue
+                    params = urllib.parse.urlencode({"filename": entry["filename"], "subfolder": entry.get("subfolder", ""), "type": entry.get("type", "output")})
+                    with urllib.request.urlopen(url + "/view?" + params, timeout=180) as response:
+                        raw = response.read()
+                    if not raw:
+                        raise RuntimeError("ComfyUI вернул пустой аудиофайл")
+                    target = Path(path).with_suffix(".wav")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    import tempfile
+                    suffix = Path(entry["filename"]).suffix.lower() or ".flac"
+                    with tempfile.TemporaryDirectory() as temp:
+                        source = Path(temp) / ("voice" + suffix)
+                        source.write_bytes(raw)
+                        result = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", str(source), "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le", str(target)], capture_output=True, timeout=120)
+                    if result.returncode or not target.is_file() or not target.stat().st_size:
+                        raise RuntimeError("Не удалось преобразовать аудио в WAV: " + result.stderr.decode("utf-8", "replace")[-500:])
+                    return str(target)
+        if status.get("completed") or status.get("status_str") == "success":
+            raise RuntimeError("ComfyUI завершил Qwen3-TTS, но не вернул аудио. Проверьте узел SaveAudioAdvanced")
+    raise RuntimeError("Озвучка Qwen3-TTS не завершилась за 10 минут")
+
+async def tts(text, path, voice=None):
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        raise RuntimeError("Пустой текст озвучки")
+    if CFG.get("voice_engine", "comfy_qwen") == "comfy_qwen":
+        return await asyncio.to_thread(qwen_tts_sync, text, path, voice)
+    return await piper_tts(text, path, voice)
 
 FPS = 24
 W, H, U = 1080, 1920, 10.8  # кадр в пикселях; холст художника 100 x 178 условных единиц, 1 единица = 10,8 px
@@ -972,6 +1053,8 @@ def delete_failed(item_id: int):
 
 @app.get("/api/voices")
 def voices():
+    if CFG.get("voice_engine", "comfy_qwen") == "comfy_qwen":
+        return {"items": [{"id": x, "name": x, "language": "multi"} for x in QWEN_SPEAKERS], "selected": CFG.get("voice", "Ryan"), "engine": "Qwen3-TTS / ComfyUI"}
     return {"items": installed_voices(), "selected": CFG.get("voice", ""), "engine": "Piper (offline)"}
 
 @app.get("/api/voice_test")
@@ -1086,6 +1169,8 @@ class Settings(BaseModel):
     niche: str
     lang: str
     voice: str
+    voice_engine: str = "comfy_qwen"
+    qwen_model: str = "0.6B"
     piper_executable: str = ""
     piper_models_dir: str = "voices"
     privacy: str
