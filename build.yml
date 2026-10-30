@@ -16,7 +16,7 @@ jobs:
         run: |
           SEP=":"; [ "$RUNNER_OS" = "Windows" ] && SEP=";"
           pyinstaller --onefile --name AIOffice --add-data "index.html${SEP}." --add-data "font.ttf${SEP}." \
-            --collect-all imageio_ffmpeg --collect-all edge_tts \
+            --collect-all imageio_ffmpeg \
             --collect-data googleapiclient --collect-submodules uvicorn main.py
       - uses: actions/upload-artifact@v4
         with:

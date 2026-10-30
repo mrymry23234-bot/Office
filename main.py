@@ -3,7 +3,6 @@ import asyncio, base64, glob, json, math, os, random, re, sqlite3, subprocess, s
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import edge_tts
 import uvicorn
 from anthropic import Anthropic
 from fastapi import FastAPI, HTTPException
@@ -20,8 +19,8 @@ else:
 MODEL, MAX_PENDING, STATS_EVERY = "claude-sonnet-5-5", 2, 3600
 SF = Path("settings.json")
 DEFAULTS = {"api_key": "", "niche": "интересные факты", "lang": "русский",
-            "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000,
-            "writer_rules": "", "editor_rules": "", "analyst_rules": "", "visual_mode": "comfy", "motion": "dynamic", "character": "", "comfy_url": "http://127.0.0.1:8188", "comfy_checkpoint": "", "image_steps": 2, "writer_paused": False, "comfy_autostart": False, "comfy_launch_command": "", "video_workflow": "", "video_prompt_node": "", "video_prompt_field": "prompt"}
+            "voice": "ru_RU", "piper_executable": "", "piper_models_dir": "voices", "privacy": "private", "hit_views": 1000,
+            "writer_rules": "", "editor_rules": "", "analyst_rules": "", "visual_mode": "comfy", "motion": "dynamic", "character": "", "comfy_url": "http://127.0.0.1:8188", "comfy_checkpoint": "", "image_steps": 2, "writer_paused": False, "comfy_autostart": False, "comfy_launch_command": "", "video_workflow": "", "video_prompt_node": "140:131", "video_prompt_field": "prompt"}
 
 def apply_settings(s=None):
     global CFG, KEY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
@@ -151,18 +150,51 @@ def make_srt(text, dur):
         out.append(f"{i}\n{ts(t)} --> {ts(e)}\n{p}\n"); t = e
     return "\n".join(out)
 
+def installed_voices():
+    folder = Path(CFG.get("piper_models_dir") or "voices").expanduser()
+    return [{"id": str(f.resolve()), "name": f.stem, "language": f.stem.split("-")[0]}
+            for f in sorted(folder.glob("*.onnx")) if f.with_suffix(".onnx.json").is_file()]
+
+def piper_command():
+    configured = CFG.get("piper_executable", "").strip()
+    if configured:
+        exe = Path(configured).expanduser()
+        if not exe.is_file():
+            raise RuntimeError("Не найден Piper: " + str(exe))
+        return str(exe)
+    import shutil
+    found = shutil.which("piper")
+    if found: return found
+    local = Path("piper") / ("piper.exe" if os.name == "nt" else "piper")
+    if local.is_file(): return str(local.resolve())
+    raise RuntimeError("Установите Piper TTS и укажите путь к piper.exe в настройках")
+
+def resolve_voice(voice=None):
+    choices = installed_voices()
+    selected = voice or CFG.get("voice", "")
+    matched = next((v for v in choices if v["id"] == selected or v["name"] == selected), None)
+    if not matched:
+        raise RuntimeError("Локальный голос не установлен. Скопируйте .onnx и .onnx.json в папку voices и выберите голос")
+    return matched["id"]
+
 async def tts(text, path, voice=None):
-    voice = voice or VOICE
-    text = re.sub(r"[^\w\s.,!?;:()«»\"'—–-]", " ", text)  # убираем эмодзи и странные символы
+    """Fully offline Piper synthesis. No network fallback."""
     text = re.sub(r"\s+", " ", text).strip()
-    last = None
-    for _ in range(4):  # сервис озвучки иногда отвечает ошибкой: пробуем тот же голос ещё раз
-        try:
-            await edge_tts.Communicate(text, voice).save(path)
-            if Path(path).stat().st_size > 0: return
-        except Exception as e:
-            last = e; await asyncio.sleep(3)
-    raise RuntimeError(f"голос {voice} недоступен: {last}")
+    if not text: raise RuntimeError("Пустой текст озвучки")
+    model = resolve_voice(voice)
+    wav = Path(path).with_suffix(".wav")
+    wav.parent.mkdir(parents=True, exist_ok=True)
+    proc = await asyncio.create_subprocess_exec(piper_command(), "--model", model, "--output_file", str(wav),
+                                                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
+                                                 stderr=asyncio.subprocess.PIPE)
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(text.encode("utf-8")), timeout=300)
+    except asyncio.TimeoutError:
+        proc.kill(); await proc.wait()
+        raise RuntimeError("Piper превысил время ожидания 5 минут")
+    if proc.returncode != 0 or not wav.is_file() or wav.stat().st_size == 0:
+        raise RuntimeError("Piper не создал аудио: " + err.decode("utf-8", "replace")[-500:])
+    return str(wav)
 
 FPS = 24
 W, H, U = 1080, 1920, 10.8  # кадр в пикселях; холст художника 100 x 178 условных единиц, 1 единица = 10,8 px
@@ -628,12 +660,14 @@ def scene_frames(i, n, stage, cast, parts, total, nframes):
 
 async def render(i, d):
     import imageio_ffmpeg
-    from mutagen.mp3 import MP3
     ff = imageio_ffmpeg.get_ffmpeg_exe()
-    mp3, out = f"videos/{i}.mp3", f"videos/{i}.mp4"
+    mp3, out = f"videos/{i}.wav", f"videos/{i}.mp4"
     scenes = d.get("scenes") or [{"text": s} for s in re.split(r"(?<=[.!?])\s+", d["narration"]) if s]
     await tts(" ".join(s["text"] for s in scenes), mp3)
-    dur, total = MP3(mp3).info.length, sum(len(s["text"]) for s in scenes)
+    import wave
+    with wave.open(mp3, "rb") as wf:
+        dur = wf.getnframes() / wf.getframerate()
+    total = max(1, sum(len(s["text"]) for s in scenes))
 
     async def run(*args):
         p = await asyncio.create_subprocess_exec(ff, "-y", *args, stdout=asyncio.subprocess.DEVNULL,
@@ -788,7 +822,8 @@ def generate_comfy_video(item_id, index, scene, script):
                     out=Path("videos")/f"{item_id}_{index}_generated{suffix}"
                     out.write_bytes(data)
                     return str(out)
-        raise RuntimeError("ComfyUI завершил граф, но не вернул видеофайл. Проверьте Save Video в API workflow")
+        if hist.get("status",{}).get("completed") or hist.get("status",{}).get("status_str") == "success":
+            raise RuntimeError("ComfyUI завершил граф, но не вернул видеофайл. Проверьте Save Video в API workflow")
     raise RuntimeError("Превышено время ожидания генерации видео (30 минут)")
 
 async def editor_loop():
@@ -935,16 +970,17 @@ def delete_failed(item_id: int):
     log(f"Сценарий #{item_id} удалён пользователем")
     return {"ok": True}
 
+@app.get("/api/voices")
+def voices():
+    return {"items": installed_voices(), "selected": CFG.get("voice", ""), "engine": "Piper (offline)"}
+
 @app.get("/api/voice_test")
-async def voice_test(voice: str):
-    if not re.fullmatch(r"[a-z]{2}-[A-Z]{2}-\w+Neural", voice): raise HTTPException(400)
-    sample = {"ru": "Привет! Так звучит этот голос.", "uk": "Привіт! Так звучить цей голос.",
-              "de": "Hallo! So klingt diese Stimme.", "es": "¡Hola! Así suena esta voz.",
-              "fr": "Bonjour ! Voici ma voix.", "pl": "Cześć! Tak brzmi ten głos."}.get(voice[:2], "Hello! This is how this voice sounds.")
-    path = f"videos/test_{voice}.mp3"
-    try: await tts(sample, path, voice)
-    except Exception: raise HTTPException(503)
-    return FileResponse(path, media_type="audio/mpeg")
+async def voice_test(voice: str = ""):
+    sample = "Hello! This is my local voice." if "en" in (voice or CFG.get("voice", "")) else "Привет! Это локальная озвучка."
+    path = "videos/voice_preview.wav"
+    try: await tts(sample, path, voice or None)
+    except Exception as exc: raise HTTPException(503, str(exc))
+    return FileResponse(path, media_type="audio/wav")
 
 class CharIn(BaseModel):
     name: str
@@ -995,6 +1031,50 @@ def character_preview(cid: str):
     buf = io.BytesIO(); fr.resize((405, 720)).save(buf, "JPEG", quality=88)
     return Response(buf.getvalue(), media_type="image/jpeg")
 
+class RevoiceRequest(BaseModel):
+    text: str
+    voice: str = ""
+
+@app.get("/api/archive")
+def archive():
+    rows = q("select id,title,status,video,yt_id from items where video is not null order by id desc")
+    return {"items": [{**dict(r), "exists": Path(r["video"]).is_file()} for r in rows]}
+
+@app.post("/api/archive/{item_id}/revoice")
+async def revoice(item_id: int, body: RevoiceRequest):
+    """Create a separate draft; never overwrite original or publish automatically."""
+    row = q("select * from items where id=?", item_id)
+    if not row: raise HTTPException(404, "Видео не найдено")
+    row = row[0]
+    original = Path(row["video"] or "")
+    if not original.is_file() or original.suffix.lower() != ".mp4":
+        raise HTTPException(404, "Исходный MP4 отсутствует")
+    if not body.text.strip(): raise HTTPException(400, "Нужен текст для новой озвучки")
+    import imageio_ffmpeg
+    # Reserve a distinct record for the new version; it must be reviewed before publishing.
+    data = json.loads(row["data"])
+    data["narration"] = body.text.strip()
+    data["parent_item_id"] = item_id
+    data["voice_override"] = body.voice or CFG.get("voice", "")
+    new_id = q("insert into items(status,title,data) values('rendering',?,?) returning id",
+               row["title"] + " (новая озвучка)", json.dumps(data, ensure_ascii=False))[0]["id"]
+    wav = Path("videos") / f"{new_id}.wav"
+    output = Path("videos") / f"{new_id}.mp4"
+    try:
+        await tts(body.text, str(wav), body.voice or None)
+        proc = await asyncio.create_subprocess_exec(imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", str(original),
+                  "-i", str(wav), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+                  "-shortest", str(output), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await proc.communicate()
+        if proc.returncode or not output.is_file():
+            raise RuntimeError("ffmpeg: " + err.decode("utf-8", "replace")[-600:])
+        q("update items set status='video_pending',video=? where id=?", str(output), new_id)
+        return {"ok": True, "id": new_id, "status": "video_pending", "message": "Новая версия ожидает одобрения"}
+    except Exception as exc:
+        q("update items set status='render_failed' where id=?", new_id)
+        q("insert into item_errors(item_id,message) values(?,?)", new_id, str(exc))
+        raise HTTPException(503, str(exc))
+
 @app.get("/media/{i}")
 def media(i: int): return FileResponse(f"videos/{i}.mp4")
 
@@ -1006,6 +1086,8 @@ class Settings(BaseModel):
     niche: str
     lang: str
     voice: str
+    piper_executable: str = ""
+    piper_models_dir: str = "voices"
     privacy: str
     hit_views: int
     writer_rules: str = ""
