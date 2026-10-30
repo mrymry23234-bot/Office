@@ -103,7 +103,7 @@ async function revise(id){const t=$("n"+id).value.trim();if(!t){alert("Напи�
 function testVoice(){const a=new Audio("/api/voice_test?voice="+encodeURIComponent($("s_voice").value));a.onerror=()=>alert("Этот голос сейчас недоступен. Выберите другой.");a.play().catch(()=>{})}
 async function decide(id,ok){await fetch("/api/decide",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,ok})});sig="";tick()}
 async function loadSet(){const s=await (await fetch("/api/settings")).json();
- $("s_niche").value=s.niche;$("s_wr").value=s.writer_rules||"";$("s_er").value=s.editor_rules||"";$("s_ar").value=s.analyst_rules||"";$("s_visual").value=s.visual_mode||"auto";$("s_comfy").value=s.comfy_url||"http://127.0.0.1:8188";$("s_ckpt").value=s.comfy_checkpoint||"";$("s_steps").value=s.image_steps||20;$("s_lang").value=s.lang;if(![...$("s_voice").options].some(o=>o.value===s.voice))$("s_voice").add(new Option(s.voice,s.voice));$("s_voice").value=s.voice;$("s_privacy").value=s.privacy;$("s_hit").value=s.hit_views;
+ $("s_niche").value=s.niche;$("s_wr").value=s.writer_rules||"";$("s_er").value=s.editor_rules||"";$("s_ar").value=s.analyst_rules||"";$("s_visual").value=s.visual_mode||"auto";$("s_comfy").value=s.comfy_url||"http://127.0.0.1:8188";$("s_ckpt").value=s.comfy_checkpoint||"";$("s_steps").value=s.image_steps||2;$("s_lang").value=s.lang;if(![...$("s_voice").options].some(o=>o.value===s.voice))$("s_voice").add(new Option(s.voice,s.voice));$("s_voice").value=s.voice;$("s_privacy").value=s.privacy;$("s_hit").value=s.hit_views;
  $("k").textContent=s.has_key?"✅":"❌";$("c").textContent=s.has_client?"✅":"❌";$("t").textContent=s.has_token?"✅ подключён":"❌ не подключён"}
 async function post(u,b){return (await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})).json()}
 async function checkComfy(){
@@ -111,7 +111,7 @@ async function checkComfy(){
  const r=await (await fetch("/api/comfy_status")).json();
  el.textContent=r.ok?" ✓ "+r.models.length+" модель(ей): "+r.models.slice(0,2).join(", "):" ✗ "+r.message;
 }
-async function save(){await post("/api/settings",{api_key:$("s_key").value,niche:$("s_niche").value,writer_rules:$("s_wr").value,editor_rules:$("s_er").value,analyst_rules:$("s_ar").value,visual_mode:$("s_visual").value,comfy_url:$("s_comfy").value,comfy_checkpoint:$("s_ckpt").value,image_steps:+$("s_steps").value||20,motion:"dynamic",lang:$("s_lang").value,voice:$("s_voice").value,privacy:$("s_privacy").value,hit_views:+$("s_hit").value||1000});$("s_key").value="";loadSet();alert("Сохранено")}
+async function save(){await post("/api/settings",{api_key:$("s_key").value,niche:$("s_niche").value,writer_rules:$("s_wr").value,editor_rules:$("s_er").value,analyst_rules:$("s_ar").value,visual_mode:$("s_visual").value,comfy_url:$("s_comfy").value,comfy_checkpoint:$("s_ckpt").value,image_steps:+$("s_steps").value||2,motion:"dynamic",lang:$("s_lang").value,voice:$("s_voice").value,privacy:$("s_privacy").value,hit_views:+$("s_hit").value||1000});$("s_key").value="";loadSet();alert("Сохранено")}
 $("s_file").onchange=async e=>{const f=e.target.files[0];if(!f)return;const r=await post("/api/client_secret",{text:await f.text()});alert(r.ok?"Файл загружен":"Не удалось прочитать файл");loadSet()}
 async function yt(){const r=await post("/api/youtube_auth",{});alert(r.ok?"YouTube подключён":"Ошибка: "+r.error);loadSet()}
 async function loadChars(sel){const d=await (await fetch("/api/characters")).json();const el=$("c_sel");

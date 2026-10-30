@@ -21,7 +21,7 @@ MODEL, MAX_PENDING, STATS_EVERY = "claude-sonnet-5-5", 2, 3600
 SF = Path("settings.json")
 DEFAULTS = {"api_key": "", "niche": "интересные факты", "lang": "русский",
             "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000,
-            "writer_rules": "", "editor_rules": "", "analyst_rules": "", "visual_mode": "comfy", "motion": "dynamic", "character": "", "comfy_url": "http://127.0.0.1:8188", "comfy_checkpoint": "", "image_steps": 20}
+            "writer_rules": "", "editor_rules": "", "analyst_rules": "", "visual_mode": "comfy", "motion": "dynamic", "character": "", "comfy_url": "http://127.0.0.1:8188", "comfy_checkpoint": "", "image_steps": 2}
 
 def apply_settings(s=None):
     global CFG, KEY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
@@ -459,12 +459,18 @@ def generate_comfy_scene(item_id, scene_index, scene, script):
     folder.mkdir(parents=True, exist_ok=True)
     target = folder / f"{scene_index+1}.png"
     if target.exists():
-        return target  # Resume does not pay/recompute already generated frames.
+        try:
+            from PIL import Image
+            with Image.open(target) as existing: existing.verify()
+            return target
+        except Exception:
+            target.unlink(missing_ok=True)
     try:
         models = comfy_checkpoints(url)
     except Exception as exc:
         raise RuntimeError("ComfyUI недоступен. Запустите ComfyUI на компьютере и проверьте адрес в настройках. " + str(exc)) from exc
-    checkpoint = CFG.get("comfy_checkpoint", "").strip() or (models[0] if models else "")
+    preferred = next((m for m in models if "sd_xl_turbo" in m.lower()), None)
+    checkpoint = CFG.get("comfy_checkpoint", "").strip() or preferred or (models[0] if models else "")
     if checkpoint not in models:
         raise RuntimeError("В ComfyUI нет выбранной модели (checkpoint). Установите модель в ComfyUI/models/checkpoints и перезапустите ComfyUI.")
     style = script.get("style", "colorful high quality 2D animated movie")
@@ -475,12 +481,17 @@ def generate_comfy_scene(item_id, scene_index, scene, script):
               "rich background, cinematic storytelling, portrait 9:16, no letters, no text, no watermark")
     negative = "low quality, crude geometry, stick figures, paint drawing, watermark, text, letters, blurry, deformed"
     seed = (item_id * 1000003 + scene_index * 7919) % (2**63-1)
+    # SDXL Turbo uses very low step counts and CFG=1; ordinary SDXL uses more steps.
+    turbo = "turbo" in checkpoint.lower()
+    steps = max(1, min(4, int(CFG.get("image_steps", 2)))) if turbo else max(8, min(40, int(CFG.get("image_steps", 20))))
+    cfg_scale = 1.0 if turbo else 7.0
+    sampler = "euler_ancestral" if turbo else "euler"
     workflow = {
       "1":{"class_type":"CheckpointLoaderSimple","inputs":{"ckpt_name":checkpoint}},
       "2":{"class_type":"CLIPTextEncode","inputs":{"text":prompt,"clip":["1",1]}},
       "3":{"class_type":"CLIPTextEncode","inputs":{"text":negative,"clip":["1",1]}},
       "4":{"class_type":"EmptyLatentImage","inputs":{"width":576,"height":1024,"batch_size":1}},
-      "5":{"class_type":"KSampler","inputs":{"seed":seed,"steps":max(8,min(40,int(CFG.get("image_steps",20)))),"cfg":7.0,"sampler_name":"euler","scheduler":"normal","denoise":1.0,"model":["1",0],"positive":["2",0],"negative":["3",0],"latent_image":["4",0]}},
+      "5":{"class_type":"KSampler","inputs":{"seed":seed,"steps":steps,"cfg":cfg_scale,"sampler_name":sampler,"scheduler":"normal","denoise":1.0,"model":["1",0],"positive":["2",0],"negative":["3",0],"latent_image":["4",0]}},
       "6":{"class_type":"VAEDecode","inputs":{"samples":["5",0],"vae":["1",2]}},
       "7":{"class_type":"SaveImage","inputs":{"filename_prefix":f"AIOffice_{item_id}_{scene_index}","images":["6",0]}}
     }
@@ -759,6 +770,9 @@ def delete_failed(item_id: int):
         db.execute("delete from item_errors where item_id=?", (item_id,))
         db.execute("delete from items where id=? and status='render_failed'", (item_id,))
         db.commit()
+    # Remove only generated scene images belonging to this failed task.
+    import shutil
+    shutil.rmtree(Path("visuals") / str(item_id), ignore_errors=True)
     log(f"Сценарий #{item_id} удалён пользователем")
     return {"ok": True}
 
@@ -841,7 +855,7 @@ class Settings(BaseModel):
     visual_mode: str = "comfy"
     comfy_url: str = "http://127.0.0.1:8188"
     comfy_checkpoint: str = ""
-    image_steps: int = 20
+    image_steps: int = 2
     motion: str = "dynamic"
 
 @app.get("/api/settings")
