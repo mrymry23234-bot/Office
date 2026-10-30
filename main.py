@@ -1,5 +1,5 @@
 """AI-офис для YouTube Shorts: сценарист -> (вы) -> монтажёр/публикатор -> (вы) -> аналитик -> сценарист."""
-import asyncio, glob, json, os, random, re, sqlite3, subprocess, sys, threading, time
+import asyncio, glob, json, math, os, random, re, sqlite3, subprocess, sys, threading, time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -7,7 +7,7 @@ import edge_tts
 import uvicorn
 from anthropic import Anthropic
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 # Работа и из исходников, и из собранного .exe: данные лежат рядом с программой
@@ -21,7 +21,7 @@ MODEL, MAX_PENDING, STATS_EVERY = "claude-sonnet-5-5", 2, 3600
 SF = Path("settings.json")
 DEFAULTS = {"api_key": "", "niche": "интересные факты", "lang": "русский",
             "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000,
-            "writer_rules": "", "editor_rules": ""}
+            "writer_rules": "", "editor_rules": "", "character": ""}
 
 def apply_settings(s=None):
     global CFG, KEY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
@@ -157,53 +157,87 @@ async def tts(text, path, voice=None):
             last = e; await asyncio.sleep(3)
     raise RuntimeError(f"голос {voice} недоступен: {last}")
 
-FPS = 15
+FPS = 24
 W, H, U = 1080, 1920, 10.8  # кадр в пикселях; холст художника 100 x 178 условных единиц, 1 единица = 10,8 px
 
-SHAPES_DOC = """Фигуры (поздние рисуются поверх ранних; цвет "#rrggbb" или с прозрачностью "#rrggbbaa", только плоские цвета, без текста и букв):
+SHAPES_DOC = """Фигуры (поздние рисуются поверх ранних; цвет "#rrggbb" или с прозрачностью "#rrggbbaa"; без текста и букв):
 {"t":"rect","x":0,"y":0,"w":10,"h":10,"c":"#hex","r":2}  прямоугольник (r: скругление, необязательно)
 {"t":"circle","x":50,"y":50,"r":5,"c":"#hex"}
 {"t":"ellipse","x":50,"y":50,"rx":8,"ry":4,"c":"#hex","rot":0}  rot в градусах, необязательно
 {"t":"poly","p":[[x,y],[x,y],[x,y]],"c":"#hex"}  многоугольник с острыми углами
 {"t":"blob","p":[[x,y],[x,y],...],"c":"#hex"}  замкнутая плавная форма по опорным точкам (тела, головы, облака, холмы)
-{"t":"line","p":[[x,y],[x,y]],"w":1,"c":"#hex"}  линия или ломаная толщиной w"""
+{"t":"line","p":[[x,y],[x,y]],"w":1,"c":"#hex"}  линия или ломаная толщиной w
+У любой фигуры (кроме line) могут быть: "c2":"#hex" (градиент сверху вниз от c к c2) и "o":"#hex","ow":0.4 (контур и его толщина)."""
 
-CAST_RULES = """Ты арт-директор мультфильма для YouTube Shorts. Создай набор повторно используемых актёров (3-7 штук): главные персонажи и ключевые предметы этого видео (например: фараон, пирамида, верблюд, облако, солнце, пальма). Каждый актёр рисуется ОДИН раз и затем используется во всех сценах, поэтому выглядит везде одинаково.
-Актёр рисуется в собственном квадрате 100x100 (центр 50,50; ноги и основание примерно на y=90, не выходи за пределы квадрата). Актёр состоит из частей (parts), которые двигаются независимо: у персонажа туловище, голова, каждая рука, каждая нога, хвост (у животных); у неподвижного предмета обычно одна часть. Порядок частей = порядок рисования (задние первыми). Не больше 10 частей и 15 фигур в части.
-Формат ответа, ТОЛЬКО JSON: {"assets":[{"id":"pharaoh","parts":[{"name":"body","pivot":[50,50],"anim":{"type":"none"},"shapes":[...]},{"name":"arm_r","pivot":[62,48],"anim":{"type":"swing","amp":30,"speed":0.7,"phase":0},"shapes":[...]}]}]}
-pivot: точка вращения части (плечо, бедро, основание хвоста). anim.type: "none"; "swing" (качание вокруг pivot на ±amp градусов, speed колебаний в секунду, phase от 0 до 1); "sway" (покачивание вбок на amp единиц); "bob" (вверх-вниз на amp единиц); "spin" (непрерывное вращение, speed оборотов в секунду). У персонажей машут руками и шагают ногами (ноги swing в противофазе: phase 0 и 0.5), качается хвост, голова слегка; облака плывут (sway), у солнца вращаются лучи (spin)."""
+STYLE_GUIDE = """СТИЛЬ: современная профессиональная 2D-анимация уровня Kurzgesagt, TED-Ed и Headspace, а не детский рисунок. Ограниченная согласованная палитра (5-7 цветов на всё видео) и их оттенки. Плавные скруглённые формы: для тел, голов, облаков, холмов используй blob, а не голые круги и треугольники. У каждой крупной формы градиент (c и c2 близких оттенков), мягкие тени и блики отдельными полупрозрачными фигурами (#00000030, #ffffff40). Тонкий тёмный контур (o, ow 0.3-0.5) у главных персонажей. У персонажей живые лица: глаза с белком, зрачком и бликом, брови, рот, румянец. Приятные пропорции как в современных мультфильмах."""
+
+PLAN_RULES = """Ты арт-директор мультфильма для YouTube Shorts. Составь план актёров: главные персонажи и ключевые предметы этого видео (3-6 штук, например: фараон, пирамида, верблюд, солнце) плюс 1-2 фоновых живых актёра (облако, птица). Каждый актёр затем рисуется ОДИН раз и используется во всех сценах, поэтому выглядит везде одинаково. Подбери палитру видео из 6 цветов.
+Верни ТОЛЬКО JSON: {"palette":["#hex","#hex","#hex","#hex","#hex","#hex"],"assets":[{"id":"pharaoh","desc":"внешность и повадки, 1-2 предложения на английском"}]}. id только латиницей."""
+
+ASSET_RULES = """Актёр рисуется в собственном квадрате 100x100 (центр 50,50; ноги и основание примерно на y=90, не выходи за квадрат). Актёр состоит из частей (parts), которые двигаются независимо: у персонажа туловище, голова, глаза, каждая рука, каждая нога, хвост или одежда (плащ, волосы) отдельными частями; у неподвижного предмета обычно одна-две части. Порядок частей = порядок рисования (задние первыми). До 12 частей, до 25 фигур в части.
+Формат ответа, ТОЛЬКО JSON: {"id":"...","parts":[{"name":"body","pivot":[50,50],"anim":{"type":"bob","amp":0.4,"speed":0.5},"shapes":[...]},{"name":"arm_r","pivot":[62,48],"anim":{"type":"swing","amp":30,"speed":0.7,"phase":0},"shapes":[...]}]}
+pivot: точка вращения части (плечо, бедро, основание хвоста). anim.type: "none"; "swing" (качание вокруг pivot на ±amp градусов, speed колебаний в секунду, phase 0..1); "sway" (вбок на amp единиц); "bob" (вверх-вниз на amp единиц); "spin" (вращение, speed оборотов в секунду); "talk" (рот открывается и закрывается, ставь на часть-рот); "blink" (часть видна только в момент моргания: нарисуй веки цвета кожи поверх глаз, speed 0.3).
+Движение должно выглядеть живым: туловище слегка дышит (bob amp 0.4), руки и ноги качаются (ноги в противофазе: phase 0 и 0.5), хвост и одежда запаздывают (меньше amp, другой phase), голова слегка кивает, моргают глаза. Облака плывут (sway), у солнца вращаются лучи (spin)."""
+
+HOST_RULES = """Это постоянный ведущий-рассказчик канала: он должен быть обаятельным, запоминающимся и выразительным, с ярким узнаваемым силуэтом. Нарисуй его целиком, в полный рост, лицом в сторону зрителя (три четверти или анфас). Обязательные части: туловище, голова, глаза, веки (anim blink), рот (anim talk), брови, обе руки (правая размахивает как при рассказе: swing amp 35, левая слегка), ноги, детали образа (волосы, шляпа, хвост, аксессуар) с запаздывающим sway или swing."""
 
 STAGE_RULES = """Холст: ширина 100, высота 178 условных единиц (вертикальный кадр 9:16), (0,0) в левом верхнем углу, y растёт вниз. Нижние 40 единиц закрывают субтитры: ничего важного туда не ставь.
-Верни ТОЛЬКО JSON: {"bg":["#цвет верха","#цвет низа"],"shapes":[неподвижный фон: небо, земля, холмы, вода, дальние объекты; координаты холста],"actors":[...]}. 10-30 фигур в shapes.
-actors: актёры из cast, рисуются по порядку (дальние первыми). Поля: {"asset":"id из cast","x":50,"y":100,"size":40,"flip":false,"to":[70,100],"bob":{"amp":1.5,"speed":2},"show":[0,1]}
-x,y: где центр актёра в начале сцены; size: ширина актёра в единицах холста; to: где он окажется в конце сцены (если двигается, иначе не указывай); flip: true, если персонаж идёт или смотрит влево; bob: подпрыгивание всего актёра (необязательно); show: доля времени сцены [от, до], когда актёр виден (так предметы появляются и исчезают).
-Кадр обязан показывать то, о чём говорит фраза, с помощью актёров из cast. Всё живое движется: персонажи идут (to) и жестикулируют (их части качаются сами), предметы переезжают, облака плывут. Ставь 3-8 актёров, главный крупнее всех и ближе к центру. Один и тот же актёр обязан быть одним и тем же во всех сценах."""
+Верни ТОЛЬКО JSON: {"bg":["#цвет верха","#цвет низа"],"shapes":[неподвижный фон в профессиональном стиле: небо с градиентом, дальние холмы, земля, объекты; координаты холста; 15-35 фигур],"fx":"dust","actors":[...]}
+fx: частицы в воздухе: "dust" (пылинки), "sparkles" (искры), "snow", "bubbles", "leaves" или "none".
+actors: актёры из cast, рисуются по порядку (дальние первыми). Поля: {"asset":"id","x":50,"y":100,"size":40,"flip":false,"to":[70,100],"bob":{"amp":1.5,"speed":2},"show":[0,1],"shadow":true}
+x,y: где центр актёра в начале сцены (землю рисуй примерно на y 100-125); size: ширина актёра в единицах холста; to: где он окажется в конце сцены; flip: true, если смотрит или идёт влево; bob: подпрыгивание всего актёра; show: доля времени сцены [от, до], когда актёр виден; shadow: false для облаков и летающих.
+Кадр обязан показывать то, о чём говорит фраза. В кадре всегда много движения: не меньше 3 актёров перемещаются (to) одновременно, облака и птицы плывут, предметы переезжают, персонажи идут и жестикулируют. Ставь 4-9 актёров, главный крупнее всех. Один и тот же актёр обязан выглядеть одинаково во всех сценах. Используй цвета палитры видео."""
 
 def rules(kind):
     r = (CFG.get("editor_rules" if kind == "e" else "writer_rules") or "").strip()
     return f"\n\nПостоянные правила владельца канала (соблюдай строго, они важнее остальных пожеланий):\n{r}" if r else ""
 
 def ask_json(prompt, max_tokens):
-    r = Anthropic(api_key=KEY).messages.create(model=MODEL, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}])
+    with Anthropic(api_key=KEY).messages.stream(model=MODEL, max_tokens=max_tokens,
+                                                messages=[{"role": "user", "content": prompt}]) as st:
+        r = st.get_final_message()
     txt = "".join(b.text for b in r.content if b.type == "text")
     return json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
 
-def make_cast(d):
+def plan_cast(d, host):
     scenes = "\n".join(f"{n+1}. {s['text']} [{s.get('image', '')}]" for n, s in enumerate(d["scenes"]))
-    chars = "; ".join(d.get("characters", [])) or "определи сам"
-    cast = ask_json(f"Видео: «{d['title']}». Стиль: {d.get('style') or 'flat cartoon'}.\nГлавные персонажи и предметы: {chars}.\n"
-                    f"Сцены:\n{scenes}\n\n" + CAST_RULES + "\n" + SHAPES_DOC + rules("e"), 16000)["assets"]
-    if not cast or not all(a.get("parts") for a in cast): raise RuntimeError("пустой набор актёров")
-    return cast
+    note = "\nВедущий-рассказчик уже существует, его НЕ включай в план." if host else ""
+    plan = ask_json(f"Видео: «{d['title']}». Стиль: {d.get('style') or 'flat cartoon'}.\nГлавные персонажи и предметы: "
+                    f"{'; '.join(d.get('characters', [])) or 'определи сам'}.{note}\nСцены:\n{scenes}\n\n" + PLAN_RULES + rules("e"), 3000)
+    if not plan.get("assets"): raise RuntimeError("пустой план")
+    return plan
 
-def make_stage(s, d, cast):
+def draw_asset(item, plan, d):
+    a = ask_json(f"Нарисуй ОДНОГО актёра «{item['id']}»: {item.get('desc', '')}. Видео: «{d['title']}».\n"
+                 f"Палитра видео (используй только эти цвета и их оттенки): {', '.join(plan.get('palette', []))}.\n\n"
+                 + STYLE_GUIDE + "\n\n" + ASSET_RULES + "\n\n" + SHAPES_DOC + rules("e"), 12000)
+    a["id"] = item["id"]
+    if not a.get("parts"): raise RuntimeError("пустой актёр")
+    return a
+
+def design_host(desc):
+    a = ask_json(f"Ты дизайнер персонажей для анимации. Создай персонажа-рассказчика, который ведёт YouTube Shorts и рассказывает зрителям истории.\n"
+                 f"Описание от владельца канала: {desc}\n\n" + STYLE_GUIDE + "\n\n" + HOST_RULES + "\n\n" + ASSET_RULES + "\n\n" + SHAPES_DOC, 16000)
+    a["id"] = "host"
+    if not a.get("parts"): raise RuntimeError("пустой персонаж")
+    return a
+
+def make_stage(s, d, cast, palette, host):
     brief = "; ".join(f"{a['id']} (части: {', '.join(p.get('name', '?') for p in a['parts'])})" for a in cast)
+    note = ("\nВедущий-рассказчик (asset \"host\") присутствует в каждой сцене: поставь его крупно сбоку на переднем плане (size 38-50, y около 112), "
+            "лицом к зрителю, он рассказывает историю и реагирует на происходящее; остальные актёры показывают сюжет.") if host else ""
     return ask_json(f"Ты режиссёр мультфильма для YouTube Shorts. Видео: «{d['title']}». Поставь кадр к фразе диктора: «{s['text']}»\n"
                     f"Что показать: {s.get('image') or s['text']}\nСтиль: {d.get('style') or 'flat cartoon'}\n"
-                    f"Доступные актёры (cast): {brief}\n\n" + SHAPES_DOC + "\n" + STAGE_RULES + rules("e"), 8000)
+                    f"Палитра видео: {', '.join(palette)}\nДоступные актёры (cast): {brief}{note}\n\n"
+                    + STYLE_GUIDE + "\n\n" + SHAPES_DOC + "\n\n" + STAGE_RULES + rules("e"), 9000)
 
-def draw_shapes(d, shapes, k, ox=0.0, oy=0.0):
-    import math
+CF = Path("characters.json")
+def load_chars(): return json.loads(CF.read_text("utf-8")) if CF.exists() else []
+def save_chars(c): CF.write_text(json.dumps(c, ensure_ascii=False), "utf-8")
+
+def draw_shapes(img, shapes, k, ox=0.0, oy=0.0):
+    from PIL import Image, ImageDraw
+    d = ImageDraw.Draw(img, "RGBA" if img.mode == "RGB" else None)
     P = lambda p: [(float(x) * k + ox, float(y) * k + oy) for x, y in p]
 
     def smooth(pts):  # срезаем углы: получается плавная форма
@@ -215,85 +249,152 @@ def draw_shapes(d, shapes, k, ox=0.0, oy=0.0):
             pts = new
         return pts
 
-    for sh in shapes[:150]:
+    def geom(sh):
+        t = sh["t"]
+        if t == "rect":
+            x, y, w, h = float(sh["x"]) * k + ox, float(sh["y"]) * k + oy, float(sh["w"]) * k, float(sh["h"]) * k
+            return ("rect", (x, y, x + w, y + h), float(sh.get("r", 0)) * k)
+        if t == "circle":
+            x, y, r = float(sh["x"]) * k + ox, float(sh["y"]) * k + oy, float(sh["r"]) * k
+            return ("ell", (x - r, y - r, x + r, y + r), 0)
+        if t == "ellipse":
+            x, y, rx, ry = float(sh["x"]) * k + ox, float(sh["y"]) * k + oy, float(sh["rx"]) * k, float(sh["ry"]) * k
+            a = math.radians(float(sh.get("rot", 0)))
+            return ("poly", [(x + rx * math.cos(q) * math.cos(a) - ry * math.sin(q) * math.sin(a),
+                              y + rx * math.cos(q) * math.sin(a) + ry * math.sin(q) * math.cos(a))
+                             for q in (j * math.pi / 36 for j in range(72))])
+        if t == "poly": return ("poly", P(sh["p"]))
+        if t == "blob": return ("poly", smooth(P(sh["p"])))
+        if t == "line": return ("line", P(sh["p"]), max(1, int(float(sh.get("w", 1)) * k)))
+        raise ValueError(t)
+
+    def fill(dr, g, c):
+        if g[0] == "rect": dr.rounded_rectangle(g[1], g[2], fill=c) if g[2] else dr.rectangle(g[1], fill=c)
+        elif g[0] == "ell": dr.ellipse(g[1], fill=c)
+        elif g[0] == "poly": dr.polygon(g[1], fill=c)
+        else: dr.line(g[1], fill=c, width=g[2], joint="curve")
+
+    def outline(g, c, w):
+        if g[0] == "rect": d.rounded_rectangle(g[1], g[2], outline=c, width=w) if g[2] else d.rectangle(g[1], outline=c, width=w)
+        elif g[0] == "ell": d.ellipse(g[1], outline=c, width=w)
+        elif g[0] == "poly": d.line(g[1] + [g[1][0]], fill=c, width=w, joint="curve")
+
+    for sh in shapes[:200]:
         try:
-            t, c = sh["t"], sh["c"]
-            if t == "rect":
-                x, y = float(sh["x"]) * k + ox, float(sh["y"]) * k + oy; w, h = float(sh["w"]) * k, float(sh["h"]) * k
-                r = float(sh.get("r", 0)) * k
-                d.rounded_rectangle((x, y, x + w, y + h), r, fill=c) if r else d.rectangle((x, y, x + w, y + h), fill=c)
-            elif t == "circle":
-                x, y, r = float(sh["x"]) * k + ox, float(sh["y"]) * k + oy, float(sh["r"]) * k
-                d.ellipse((x - r, y - r, x + r, y + r), fill=c)
-            elif t == "ellipse":
-                x, y, rx, ry = float(sh["x"]) * k + ox, float(sh["y"]) * k + oy, float(sh["rx"]) * k, float(sh["ry"]) * k
-                a = math.radians(float(sh.get("rot", 0)))
-                d.polygon([(x + rx * math.cos(q) * math.cos(a) - ry * math.sin(q) * math.sin(a),
-                            y + rx * math.cos(q) * math.sin(a) + ry * math.sin(q) * math.cos(a))
-                           for q in (j * math.pi / 30 for j in range(60))], fill=c)
-            elif t == "poly": d.polygon(P(sh["p"]), fill=c)
-            elif t == "blob": d.polygon(smooth(P(sh["p"])), fill=c)
-            elif t == "line": d.line(P(sh["p"]), fill=c, width=max(1, int(float(sh.get("w", 1)) * k)), joint="curve")
+            g, c, c2 = geom(sh), sh["c"], sh.get("c2")
+            if c2 and g[0] != "line":  # градиент: рисуем форму маской и заливаем градиентом по её рамке
+                m = Image.new("L", img.size, 0); fill(ImageDraw.Draw(m), g, 255)
+                bb = m.getbbox()
+                if bb:
+                    bw, bh = bb[2] - bb[0], bb[3] - bb[1]
+                    gr = Image.composite(Image.new("RGBA", (bw, bh), c2), Image.new("RGBA", (bw, bh), c),
+                                         Image.linear_gradient("L").resize((bw, bh)))
+                    img.paste(gr, bb[:2], m.crop(bb))
+            else:
+                fill(d, g, c)
+            if sh.get("o"): outline(g, sh["o"], max(1, int(float(sh.get("ow", .4)) * k)))
         except Exception:
             continue  # одна кривая фигура не должна ломать весь рисунок
 
 def render_bg(stage):
-    from PIL import Image, ImageDraw
+    from PIL import Image
     SS = 2
     bg = (stage or {}).get("bg") or ["#1e3a8a", "#0ea5e9"]
     img = Image.composite(Image.new("RGB", (W * SS, H * SS), bg[-1]), Image.new("RGB", (W * SS, H * SS), bg[0]),
                           Image.linear_gradient("L").resize((W * SS, H * SS)))
-    draw_shapes(ImageDraw.Draw(img, "RGBA"), (stage or {}).get("shapes", []), U * SS)
+    draw_shapes(img, (stage or {}).get("shapes", []), U * SS)
     return img.resize((W, H), Image.LANCZOS)
 
 def make_sprite(part, size):
     """Часть актёра как прозрачная картинка; вокруг запас в 25 единиц, чтобы часть могла качаться."""
-    from PIL import Image, ImageDraw
+    from PIL import Image
     k = size * U / 100; side = max(8, int(150 * k)); SS = 2 if side <= 1100 else 1
     img = Image.new("RGBA", (side * SS, side * SS), (0, 0, 0, 0))
-    draw_shapes(ImageDraw.Draw(img), part.get("shapes", []), k * SS, 25 * k * SS, 25 * k * SS)
+    draw_shapes(img, part.get("shapes", []), k * SS, 25 * k * SS, 25 * k * SS)
     return img.resize((side, side), Image.LANCZOS) if SS > 1 else img
 
 def build_actors(stage, cast):
-    from PIL import ImageOps
+    from PIL import Image, ImageOps
     by, out = {a["id"]: a for a in cast}, []
-    for ac in (stage or {}).get("actors", [])[:12]:
+    for ac in (stage or {}).get("actors", [])[:14]:
         a = by.get(ac.get("asset"))
         if not a: continue
         size = max(5.0, min(120.0, float(ac.get("size", 40)))); k = size * U / 100; flip = bool(ac.get("flip")); parts = []
-        for p in a["parts"][:12]:
-            sp, pv = make_sprite(p, size), p.get("pivot", [50, 50])
+        for p in a["parts"][:14]:
+            sp, pv, an = make_sprite(p, size), p.get("pivot", [50, 50]), p.get("anim") or {}
             px, py = (float(pv[0]) + 25) * k, (float(pv[1]) + 25) * k
             if flip: sp, px = ImageOps.mirror(sp), sp.width - px
-            parts.append((sp, (px, py), p.get("anim") or {}))
-        x, y = float(ac.get("x", 50)), float(ac.get("y", 100))
-        out.append({"parts": parts, "k": k, "x": x, "y": y, "to": ac.get("to") or [x, y], "flip": flip,
-                    "bob": ac.get("bob") or {}, "show": ac.get("show") or [0, 1]})
+            bb = sp.getbbox()
+            if not bb: continue
+            x0, y0, x1, y1 = bb; crop = sp.crop(bb)
+            if an.get("type") in ("swing", "spin"):  # холст вокруг оси вращения: крутим только нужный кусок
+                R = int(max(math.hypot(cx - px, cy - py) for cx in (x0, x1) for cy in (y0, y1))) + 3
+                cv = Image.new("RGBA", (2 * R, 2 * R), (0, 0, 0, 0)); cv.paste(crop, (int(R - px + x0), int(R - py + y0)))
+                parts.append({"img": cv, "ox": px - R, "oy": py - R, "rot": R, "an": an})
+            else:
+                parts.append({"img": crop, "ox": x0, "oy": y0, "rot": None, "an": an, "pv": (px - x0, py - y0)})
+        x, y = float(ac.get("x", 50)), float(ac.get("y", 100)); to = ac.get("to") or [x, y]
+        bob = ac.get("bob") or ({"amp": 0.8, "speed": 2.2} if math.hypot(float(to[0]) - x, float(to[1]) - y) > 3 else {})
+        out.append({"parts": parts, "k": k, "x": x, "y": y, "to": to, "flip": flip, "bob": bob,
+                    "show": ac.get("show") or [0, 1], "shadow": ac.get("shadow", True) and y > 75})
     return out
 
 def ease(t): return t * t * (3 - 2 * t)
 
-def compose(bg, actors, t, sec, overlay):
-    import math
-    from PIL import Image
-    fr = bg.copy()
+_VIG = None
+def vignette():
+    global _VIG
+    if _VIG is None:
+        from PIL import Image
+        a = Image.radial_gradient("L").resize((W, H)).point(lambda v: int(max(0, v - 120) * 0.85))
+        _VIG = Image.new("RGBA", (W, H), (0, 0, 0, 0)); _VIG.putalpha(a)
+    return _VIG
+
+def make_particles(n, seed):
+    r = random.Random(seed)
+    return [(r.uniform(0, W), r.uniform(0, H), r.uniform(3, 9), r.uniform(0.4, 1.4), r.uniform(0, 6.28)) for _ in range(n)]
+
+def draw_fx(fr, kind, parts, sec):
+    from PIL import ImageDraw
+    d = ImageDraw.Draw(fr, "RGBA")
+    for x, y, r, sp, ph in parts:
+        if kind in ("snow", "leaves"): yy, xx = (y + sec * sp * 70) % H, x + math.sin(sec * 1.3 + ph) * 30
+        else: yy, xx = (y - sec * sp * 45) % H, x + math.sin(sec * 1.1 + ph) * 35
+        a = int(70 + 150 * abs(math.sin(sec * 2 + ph))) if kind == "sparkles" else 110
+        d.ellipse((xx - r, yy - r, xx + r, yy + r), fill=(255, 255, 255, a))
+
+def compose(bg, actors, t, sec, overlay=None, cam=None, fx=None):
+    from PIL import Image, ImageDraw
+    fr = bg.copy(); e = ease(t)
     for ac in actors:
         if not (ac["show"][0] <= t <= ac["show"][1]): continue
-        e = ease(t)
         cx = (ac["x"] + (float(ac["to"][0]) - ac["x"]) * e) * U
         cy = (ac["y"] + (float(ac["to"][1]) - ac["y"]) * e) * U
         if ac["bob"]: cy -= abs(math.sin(math.pi * float(ac["bob"].get("speed", 1)) * sec)) * float(ac["bob"].get("amp", 1)) * U
-        ox, oy = cx - 75 * ac["k"], cy - 75 * ac["k"]
-        for sp, (px, py), an in ac["parts"]:
-            ty, amp = an.get("type", "none"), float(an.get("amp", 0))
+        if ac["shadow"]:
+            r = ac["k"] * 26; fy = cy + 40 * ac["k"]
+            ImageDraw.Draw(fr, "RGBA").ellipse((cx - r, fy - r * .2, cx + r, fy + r * .2), fill=(0, 0, 0, 55))
+        ax, ay = cx - 75 * ac["k"], cy - 75 * ac["k"]
+        for p in ac["parts"]:
+            an = p["an"]; ty, amp = an.get("type", "none"), float(an.get("amp", 0))
             ph = 2 * math.pi * (float(an.get("speed", 0)) * sec + float(an.get("phase", 0)))
-            ang = dx = dy = 0.0
+            ang = dx = dy = 0.0; img, oy = p["img"], p["oy"]
+            if ty == "blink" and (float(an.get("speed", .3)) * sec + float(an.get("phase", 0))) % 1 > 0.07: continue
             if ty == "swing": ang = amp * math.sin(ph) * (-1 if ac["flip"] else 1)
             elif ty == "spin": ang = math.degrees(ph)
             elif ty == "sway": dx = amp * math.sin(ph) * U
             elif ty == "bob": dy = amp * math.sin(ph) * U
-            img = sp.rotate(ang, center=(px, py), resample=Image.BICUBIC) if abs(ang) > 0.3 else sp
-            fr.paste(img, (int(ox + dx), int(oy + dy)), img)
+            elif ty == "talk":  # рот открывается и закрывается
+                sy = 0.3 + 0.7 * abs(math.sin(math.pi * float(an.get("speed", 2.5)) * sec))
+                img = img.resize((img.width, max(1, int(img.height * sy)))); oy = p["oy"] + p["pv"][1] * (1 - sy)
+            if p["rot"] and abs(ang) > 0.3: img = img.rotate(ang, center=(p["rot"], p["rot"]), resample=Image.BICUBIC)
+            fr.paste(img, (int(ax + p["ox"] + dx), int(ay + oy + dy)), img)
+    if fx: draw_fx(fr, fx[0], fx[1], sec)
+    if cam:  # плавный наезд или отъезд камеры с лёгким панорамированием
+        z = cam[0] + (cam[1] - cam[0]) * e; cw, ch = W / z, H / z
+        x0 = (W - cw) / 2 * (1 + cam[2] * (2 * e - 1)); y0 = (H - ch) / 2
+        fr = fr.resize((W, H), Image.BICUBIC, box=(x0, y0, x0 + cw, y0 + ch))
+    fr.paste(vignette(), (0, 0), vignette())
     if overlay: fr.paste(overlay, (0, H - overlay.height), overlay)
     return fr
 
@@ -319,7 +420,7 @@ def sub_overlay(text, n, total):
     h = 700
     ov = Image.new("RGBA", (W, h), (0, 0, 0, 0))
     shade = Image.new("RGBA", (W, h), (0, 0, 0, 255))
-    shade.putalpha(Image.linear_gradient("L").resize((W, h)).point(lambda v: int(v * 0.75)))
+    shade.putalpha(Image.linear_gradient("L").resize((W, h)).point(lambda v: int(v * 0.7)))
     ov.alpha_composite(shade)
     d, f, lines, cur = ImageDraw.Draw(ov), ImageFont.truetype(font_path(), 46), [], ""
     for w in text.split():
@@ -335,14 +436,17 @@ def sub_overlay(text, n, total):
     return ov
 
 def scene_frames(i, n, stage, cast, parts, total, nframes):
-    """Рисует все кадры сцены: фон, актёры с движением частей и субтитры."""
+    """Рисует все кадры сцены: фон, актёры с движением частей, частицы, камера и субтитры."""
     bg, actors = render_bg(stage), build_actors(stage, cast)
+    kind = (stage or {}).get("fx", "dust")
+    fx = (kind, make_particles(26, i * 100 + n)) if kind not in ("none", None, "") else None
+    cam = ((1.0, 1.12) if n % 2 == 0 else (1.12, 1.0)) + ((n % 3 - 1) * 0.6,)
     acc, bounds, s = 0, [], sum(len(c) for c in parts)
     for c in parts:
         acc += len(c); bounds.append((acc / s, sub_overlay(c, n, total)))
     for f in range(nframes):
         ov = next((o for b, o in bounds if f / nframes < b), bounds[-1][1])
-        compose(bg, actors, f / max(1, nframes - 1), f / FPS, ov).save(f"videos/{i}_{n}_{f:04d}.jpg", quality=90)
+        compose(bg, actors, f / max(1, nframes - 1), f / FPS, ov, cam, fx).save(f"videos/{i}_{n}_{f:04d}.jpg", quality=90)
 
 async def render(i, d):
     import imageio_ffmpeg
@@ -364,14 +468,23 @@ async def render(i, d):
             except Exception as e: log(f"Монтажёр: {what} не получилось ({e})")
         return None
 
-    setag("editor", "working", "Придумывает и рисует персонажей")
-    cast = await retry(make_cast, "создание персонажей", d) or []
-    sem = asyncio.Semaphore(3)
+    host = next((c["asset"] for c in load_chars() if c["id"] == CFG.get("character")), None)
+    setag("editor", "working", "Придумывает персонажей")
+    plan = await retry(plan_cast, "план персонажей", d, bool(host))
+    sem, cast, palette = asyncio.Semaphore(3), [], []
+    if plan:
+        palette = plan.get("palette", [])
+        async def one(item):
+            async with sem: return await retry(draw_asset, f"рисунок «{item.get('id')}»", item, plan, d)
+        setag("editor", "working", "Рисует персонажей и предметы")
+        cast = [a for a in await asyncio.gather(*(one(it) for it in plan["assets"][:8])) if a]
+    if host: cast.append({**host, "id": "host"})
 
     async def stage(s):
         async with sem:
-            return await retry(make_stage, "постановка кадра", s, d, cast) if cast else None
+            return await retry(make_stage, "постановка кадра", s, d, cast, palette, bool(host)) if cast else None
 
+    setag("editor", "working", "Ставит кадры")
     stages = await asyncio.gather(*(stage(s) for s in scenes))
     segs, last = [], None
     for n, s in enumerate(scenes):
@@ -381,7 +494,7 @@ async def render(i, d):
         nframes = max(2, round(dur * len(s["text"]) / total * FPS))
         await asyncio.to_thread(scene_frames, i, n, st, cast, chunks(s["text"]), len(scenes), nframes)
         seg = f"videos/{i}_{n}.mp4"
-        if not await run("-framerate", str(FPS), "-i", f"videos/{i}_{n}_%04d.jpg", "-vf", "fps=30,format=yuv420p",
+        if not await run("-framerate", str(FPS), "-i", f"videos/{i}_{n}_%04d.jpg", "-vf", "format=yuv420p",
                          "-c:v", "libx264", "-preset", "veryfast", seg):
             raise RuntimeError("ffmpeg не смог собрать сцену")
         for x in glob.glob(f"videos/{i}_{n}_*.jpg"): os.remove(x)
@@ -502,6 +615,55 @@ async def voice_test(voice: str):
     except Exception: raise HTTPException(503)
     return FileResponse(path, media_type="audio/mpeg")
 
+class CharIn(BaseModel):
+    name: str
+    description: str
+
+class Sel(BaseModel):
+    id: str = ""
+
+@app.get("/api/characters")
+def characters():
+    return {"items": [{"id": c["id"], "name": c["name"], "description": c["description"]} for c in load_chars()],
+            "active": CFG.get("character", "")}
+
+@app.post("/api/characters")
+async def create_character(c: CharIn):
+    err, asset = None, None
+    for _ in range(2):
+        try:
+            asset = await asyncio.to_thread(design_host, c.description); break
+        except Exception as e:
+            err = e
+    if not asset: return {"ok": False, "error": str(err)}
+    cid = "c" + str(int(time.time()))
+    save_chars([x for x in load_chars() if x["name"] != c.name] +
+               [{"id": cid, "name": c.name, "description": c.description, "asset": asset}])
+    return {"ok": True, "id": cid}
+
+@app.post("/api/character_select")
+def character_select(s: Sel):
+    CFG["character"] = s.id; SF.write_text(json.dumps(CFG, ensure_ascii=False), "utf-8")
+    return {"ok": True}
+
+@app.post("/api/character_delete")
+def character_delete(s: Sel):
+    save_chars([x for x in load_chars() if x["id"] != s.id])
+    if CFG.get("character") == s.id: character_select(Sel(id=""))
+    return {"ok": True}
+
+@app.get("/api/character_preview/{cid}")
+def character_preview(cid: str):
+    import io
+    c = next((x for x in load_chars() if x["id"] == cid), None)
+    if not c: raise HTTPException(404)
+    stage = {"bg": ["#e0f2fe", "#bae6fd"], "fx": "none",
+             "shapes": [{"t": "rect", "x": 0, "y": 118, "w": 100, "h": 60, "c": "#fde68a", "c2": "#fcd34d"}],
+             "actors": [{"asset": "host", "x": 50, "y": 92, "size": 80}]}
+    fr = compose(render_bg(stage), build_actors(stage, [{**c["asset"], "id": "host"}]), 0.5, 0.4)
+    buf = io.BytesIO(); fr.resize((405, 720)).save(buf, "JPEG", quality=88)
+    return Response(buf.getvalue(), media_type="image/jpeg")
+
 @app.get("/media/{i}")
 def media(i: int): return FileResponse(f"videos/{i}.mp4")
 
@@ -527,6 +689,7 @@ def get_settings():
 def set_settings(s: Settings):
     new = s.model_dump()
     if not new["api_key"]: new["api_key"] = KEY
+    new["character"] = CFG.get("character", "")
     SF.write_text(json.dumps(new, ensure_ascii=False), "utf-8"); apply_settings(new)
     return {"ok": True}
 

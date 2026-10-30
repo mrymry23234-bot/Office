@@ -37,6 +37,15 @@ textarea{display:block;width:100%;min-height:54px;margin:0 0 8px;padding:6px;bor
  <div class="card"><h2>Нужно ваше решение</h2><div id="reqs"></div></div>
  <div class="card"><h2>Статистика канала</h2><div id="vids"></div></div>
  <div class="card"><h2>Журнал</h2><div class="log" id="log"></div></div>
+ <div class="card"><h2>🎭 Персонаж-рассказчик (монтажёр)</h2>
+  <label>Персонаж в видео<select id="c_sel" onchange="selChar()"></select></label>
+  <img id="c_img" style="display:none;width:150px;border-radius:10px;margin-bottom:10px">
+  <button type="button" class="n" id="c_del" onclick="delChar()" style="display:none;margin-bottom:10px">Удалить персонажа</button>
+  <hr>
+  <label>Имя нового персонажа<input id="c_name" placeholder="Например: Профессор Сова"></label>
+  <label>Как он выглядит и какой у него характер<textarea id="c_desc" style="min-height:80px" placeholder="Например: добрая сова в круглых очках и красном шарфе, любит рассказывать истории, немного ворчливая"></textarea></label>
+  <button type="button" class="y" id="c_btn" onclick="createChar()">Создать персонажа</button> <span id="c_st"></span>
+ </div>
  <div class="card"><h2>⚙️ Настройки</h2>
   <label>Ключ Claude API <span id="k"></span><input id="s_key" type="password" placeholder="sk-ant-..."></label>
   <label>Тема канала<input id="s_niche"></label>
@@ -85,7 +94,19 @@ async function post(u,b){return (await fetch(u,{method:"POST",headers:{"Content-
 async function save(){await post("/api/settings",{api_key:$("s_key").value,niche:$("s_niche").value,writer_rules:$("s_wr").value,editor_rules:$("s_er").value,lang:$("s_lang").value,voice:$("s_voice").value,privacy:$("s_privacy").value,hit_views:+$("s_hit").value||1000});$("s_key").value="";loadSet();alert("Сохранено")}
 $("s_file").onchange=async e=>{const f=e.target.files[0];if(!f)return;const r=await post("/api/client_secret",{text:await f.text()});alert(r.ok?"Файл загружен":"Не удалось прочитать файл");loadSet()}
 async function yt(){const r=await post("/api/youtube_auth",{});alert(r.ok?"YouTube подключён":"Ошибка: "+r.error);loadSet()}
-loadSet();tick();setInterval(tick,1500);
+async function loadChars(sel){const d=await (await fetch("/api/characters")).json();const el=$("c_sel");
+ el.innerHTML='<option value="">Без персонажа</option>'+d.items.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
+ el.value=sel!==undefined?sel:d.active;if(el.value!==(sel!==undefined?sel:d.active))el.value="";showChar()}
+function showChar(){const id=$("c_sel").value;$("c_img").style.display=id?"block":"none";$("c_del").style.display=id?"inline-block":"none";if(id)$("c_img").src="/api/character_preview/"+id+"?t="+Date.now()}
+async function selChar(){await post("/api/character_select",{id:$("c_sel").value});showChar()}
+async function delChar(){if(!confirm("Удалить этого персонажа?"))return;await post("/api/character_delete",{id:$("c_sel").value});loadChars("")}
+async function createChar(){const name=$("c_name").value.trim(),desc=$("c_desc").value.trim();if(!name||!desc){alert("Заполните имя и описание");return}
+ $("c_btn").disabled=true;$("c_st").textContent="Создаю, это займёт 1-2 минуты…";
+ try{const r=await post("/api/characters",{name,description:desc});
+  if(r.ok){await post("/api/character_select",{id:r.id});await loadChars(r.id);$("c_st").textContent="Готово: персонаж создан и выбран";$("c_name").value="";$("c_desc").value=""}
+  else $("c_st").textContent="Не получилось: "+r.error}catch(e){$("c_st").textContent="Ошибка связи с программой"}
+ $("c_btn").disabled=false}
+loadChars();loadSet();tick();setInterval(tick,1500);
 </script>
 </body>
 </html>
