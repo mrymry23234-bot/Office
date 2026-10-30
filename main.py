@@ -21,7 +21,7 @@ MODEL, MAX_PENDING, STATS_EVERY = "claude-sonnet-5-5", 2, 3600
 SF = Path("settings.json")
 DEFAULTS = {"api_key": "", "niche": "интересные факты", "lang": "русский",
             "voice": "ru-RU-DmitryNeural", "privacy": "private", "hit_views": 1000,
-            "writer_rules": "", "editor_rules": "", "analyst_rules": "", "visual_mode": "comfy", "motion": "dynamic", "character": "", "comfy_url": "http://127.0.0.1:8188", "comfy_checkpoint": "", "image_steps": 2}
+            "writer_rules": "", "editor_rules": "", "analyst_rules": "", "visual_mode": "comfy", "motion": "dynamic", "character": "", "comfy_url": "http://127.0.0.1:8188", "comfy_checkpoint": "", "image_steps": 2, "writer_paused": False, "comfy_autostart": False, "comfy_launch_command": "", "video_workflow": "", "video_prompt_node": "", "video_prompt_field": "prompt"}
 
 def apply_settings(s=None):
     global CFG, KEY, NICHE, LANG, VOICE, PRIVACY, HIT_VIEWS
@@ -40,6 +40,7 @@ db.row_factory = sqlite3.Row
 db.execute("""create table if not exists items(id integer primary key, status text, title text,
               data text, video text, yt_id text, views integer default 0)""")
 db.execute("""create table if not exists item_errors(item_id integer primary key, message text, updated_at text default current_timestamp)""")
+db.execute("""create table if not exists hired_agents(id integer primary key, name text not null, task text not null, status text default 'idle', result text default '', created_at text default current_timestamp)""")
 db.commit()
 lock = threading.Lock()
 
@@ -107,6 +108,10 @@ def gen_script(insights, titles):
 
 async def writer_loop():
     while True:
+        if CFG.get("writer_paused", False):
+            setag("writer", "paused", "На паузе по вашему решению")
+            await asyncio.sleep(2)
+            continue
         rv = q("select * from items where status='script_revise' limit 1")
         if rv:
             rv = rv[0]; setag("writer", "working", "Переписывает по вашим правкам")
@@ -643,6 +648,7 @@ async def render(i, d):
 
     visual_mode = CFG.get("visual_mode", "auto")
     comfy_mode = visual_mode in ("comfy", "comfy_layers")
+    video_mode = visual_mode == "comfy_video"
     layered_mode = visual_mode == "comfy_layers"
     illustration_mode = visual_mode == "illustrations"
     auto_mode = visual_mode == "auto"
@@ -652,7 +658,11 @@ async def render(i, d):
     missing = [n for n in range(len(scenes)) if not ((Path("visuals") / str(i) / f"{n+1}_background.png").exists() and (Path("visuals") / str(i) / f"{n+1}_actor.png").exists())] if layered_mode else [n for n in range(len(scenes)) if not has_image(n)]
     # Auto mode never requires the user to supply visuals; it falls back to
     # the built-in procedural renderer until a local image model is connected.
-    need_procedural = not (illustration_mode or comfy_mode) and (not auto_mode or bool(missing))
+    need_procedural = not (illustration_mode or comfy_mode or video_mode) and (not auto_mode or bool(missing))
+    if video_mode:
+        started = await asyncio.to_thread(ensure_comfy_background)
+        if not started["ok"]: raise RuntimeError(started["message"])
+        video_workflow_graph()  # ошибка конфигурации до начала дорогой генерации
     if comfy_mode and missing:
         setag("editor", "working", "Генерирует мультяшные иллюстрации через ComfyUI")
         for n in missing:
@@ -688,6 +698,19 @@ async def render(i, d):
         st = stages[n] or last  # если кадр не поставился, берём предыдущий
         last = st or last
         nframes = max(2, round(dur * len(s["text"]) / total * FPS))
+        if video_mode:
+            generated = Path("videos") / f"{i}_{n}_generated.mp4"
+            if not generated.is_file():
+                generated = Path(await asyncio.to_thread(generate_comfy_video, i, n, s, d))
+            seg = f"videos/{i}_{n}.mp4"
+            # Нормализуем длительность и формат под общий таймлайн озвучки.
+            seconds = max(.5, nframes / FPS)
+            if not await run("-stream_loop", "-1", "-i", str(generated), "-t", str(seconds),
+                             "-vf", f"fps={FPS},scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},format=yuv420p",
+                             "-an", "-c:v", "libx264", "-preset", "veryfast", seg):
+                raise RuntimeError("ffmpeg не смог обработать видеосцену ComfyUI")
+            segs.append(Path(seg).name)
+            continue
         if layered_mode:
             await asyncio.to_thread(layered_frames, i, n, chunks(s["text"]), len(scenes), nframes)
         elif illustration_mode or comfy_mode or (auto_mode and has_image(n)):
@@ -707,6 +730,66 @@ async def render(i, d):
         raise RuntimeError("ffmpeg завершился с ошибкой")
     for x in glob.glob(f"videos/{i}_*"): os.remove(x)
     return out
+
+# Локальная генерация видео по API workflow ComfyUI.
+# Экспортируйте рабочий граф через Save (API Format), а не обычный UI JSON.
+def video_workflow_graph():
+    path = Path("video_workflow_api.json")
+    if not path.is_file():
+        raise RuntimeError("Сначала загрузите API JSON рабочего графа Pika H3 Flex в настройках")
+    graph = json.loads(path.read_text("utf-8"))
+    if "prompt" in graph and isinstance(graph["prompt"], dict): graph = graph["prompt"]
+    if not isinstance(graph, dict) or not any(isinstance(v,dict) and "class_type" in v for v in graph.values()):
+        raise RuntimeError("Нужен экспорт ComfyUI в API Format с class_type для узлов")
+    return graph
+
+def generate_comfy_video(item_id, index, scene, script):
+    import copy
+    graph = copy.deepcopy(video_workflow_graph())
+    prompt = (f"Vertical 9:16 3D animated cartoon movie. Main subject clearly visible: "
+              f"{scene.get('focus') or scene.get('subject') or scene.get('image') or script.get('title','')}. "
+              f"Action: {scene.get('motion') or scene.get('image') or scene.get('text','')}. "
+              "Natural blinking and expressive motion, consistent anatomy, cinematic framing, no text or subtitles.")
+    node_id = str(CFG.get("video_prompt_node", "")).strip()
+    field = CFG.get("video_prompt_field", "prompt").strip() or "prompt"
+    if node_id:
+        if node_id not in graph or field not in graph[node_id].get("inputs",{}):
+            raise RuntimeError(f"Поле промпта {node_id}.{field} отсутствует в API графе")
+        graph[node_id]["inputs"][field] = prompt
+    else:
+        # Автопоиск поддерживает только однозначное текстовое поле.
+        matches = [(k, key) for k, node in graph.items() for key,val in node.get("inputs",{}).items()
+                   if key in ("prompt", "text", "positive_prompt") and isinstance(val,str) and len(val)>30]
+        if len(matches)!=1:
+            raise RuntimeError("Не удалось однозначно определить промпт: укажите ID узла и поле в настройках")
+        graph[matches[0][0]]["inputs"][matches[0][1]] = prompt
+    url=CFG.get("comfy_url", "http://127.0.0.1:8188").rstrip("/")
+    client=str(uuid.uuid4())
+    result=comfy_json(url,"/prompt",{"prompt":graph,"client_id":client},timeout=60)
+    if result.get("node_errors"):
+        raise RuntimeError("ComfyUI отклонил граф: "+str(result["node_errors"])[:500])
+    pid=result.get("prompt_id")
+    if not pid: raise RuntimeError("ComfyUI не вернул prompt_id")
+    for _ in range(900):
+        time.sleep(2)
+        hist=comfy_json(url,"/history/"+urllib.parse.quote(pid),timeout=30).get(pid)
+        if not hist: continue
+        if hist.get("status",{}).get("status_str")=="error":
+            raise RuntimeError("Ошибка генерации ComfyUI: "+str(hist.get("status",{}).get("messages",[]))[-700:])
+        for output in hist.get("outputs",{}).values():
+            for key in ("gifs","videos","images"):
+                for entry in output.get(key,[]):
+                    name=entry.get("filename","")
+                    if not name.lower().endswith((".mp4",".webm",".mov",".gif")):continue
+                    params=urllib.parse.urlencode({"filename":name,"subfolder":entry.get("subfolder",""),"type":entry.get("type","output")})
+                    with urllib.request.urlopen(url+"/view?"+params,timeout=180) as response:
+                        data=response.read()
+                    suffix=Path(name).suffix.lower()
+                    out=Path("videos")/f"{item_id}_{index}_generated{suffix}"
+                    out.write_bytes(data)
+                    return str(out)
+        raise RuntimeError("ComfyUI завершил граф, но не вернул видеофайл. Проверьте Save Video в API workflow")
+    raise RuntimeError("Превышено время ожидания генерации видео (30 минут)")
 
 async def editor_loop():
     while True:
@@ -776,7 +859,9 @@ async def analyst_loop():
 async def lifespan(_):
     # A terminated application must not strand an approved script in 'rendering'.
     q("update items set status='render_failed' where status='rendering'")
-    for f in (writer_loop, editor_loop, analyst_loop): asyncio.create_task(f())
+    if CFG.get("comfy_autostart"):
+        asyncio.create_task(asyncio.to_thread(ensure_comfy_background))
+    for f in (writer_loop, editor_loop, analyst_loop, hired_agent_loop): asyncio.create_task(f())
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -789,7 +874,7 @@ class Decision(BaseModel):
 @app.get("/api/state")
 def state():
     rows = q("select id,status,title,data,views from items order by id desc")
-    return {"agents": AG, "log": LOG[:30],
+    return {"hired": [dict(r) for r in q("select * from hired_agents order by id")], "agents": AG, "writer_paused": bool(CFG.get("writer_paused")), "log": LOG[:30],
             "pending": [{"id": r["id"], "kind": r["status"], "title": r["title"],
                          "text": json.loads(r["data"]).get("narration", ""),
                          "error": (q("select message from item_errors where item_id=?", r["id"])[0]["message"]
@@ -797,6 +882,16 @@ def state():
                         for r in rows if r["status"] in ("script_pending", "video_pending", "render_failed")],
             "videos": [{"title": r["title"], "views": r["views"], "hit": r["views"] >= HIT_VIEWS}
                        for r in rows if r["status"] == "published"]}
+
+@app.post("/api/writer_pause")
+def writer_pause(body: dict):
+    paused = body.get("paused")
+    if not isinstance(paused, bool):
+        raise HTTPException(400, "Ожидается paused: true или false")
+    CFG["writer_paused"] = paused
+    SF.write_text(json.dumps(CFG, ensure_ascii=False, indent=2), "utf-8")
+    log("Сценарист: " + ("поставлен на паузу" if paused else "возобновил работу"))
+    return {"ok": True, "paused": paused}
 
 @app.post("/api/decide")
 def decide(d: Decision):
@@ -921,6 +1016,11 @@ class Settings(BaseModel):
     comfy_checkpoint: str = ""
     image_steps: int = 2
     motion: str = "dynamic"
+    comfy_autostart: bool = False
+    comfy_launch_command: str = ""
+    video_workflow: str = ""
+    video_prompt_node: str = ""
+    video_prompt_field: str = "prompt"
 
 @app.get("/api/settings")
 def get_settings():
@@ -932,8 +1032,50 @@ def set_settings(s: Settings):
     new = s.model_dump()
     if not new["api_key"]: new["api_key"] = KEY
     new["character"] = CFG.get("character", "")
+    new["writer_paused"] = CFG.get("writer_paused", False)
     SF.write_text(json.dumps(new, ensure_ascii=False), "utf-8"); apply_settings(new)
     return {"ok": True}
+
+# Фоновый запуск локального ComfyUI. Путь задаёт пользователь; никаких shell-команд.
+_COMFY_PROCESS = None
+
+def comfy_reachable():
+    try:
+        comfy_json(CFG.get("comfy_url", "http://127.0.0.1:8188"), "/system_stats", timeout=3)
+        return True
+    except Exception:
+        return False
+
+def ensure_comfy_background():
+    global _COMFY_PROCESS
+    if comfy_reachable():
+        return {"ok": True, "message": "ComfyUI уже работает"}
+    command = CFG.get("comfy_launch_command", "").strip()
+    if not command:
+        return {"ok": False, "message": "Укажите путь к run_nvidia_gpu.bat или python.exe ComfyUI в настройках"}
+    target = Path(command).expanduser()
+    if not target.is_file() or target.suffix.lower() not in (".bat", ".cmd", ".exe"):
+        return {"ok": False, "message": "Нужен существующий .bat, .cmd или .exe файл"}
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # Запускаем только локальный файл, без shell=True.
+        _COMFY_PROCESS = subprocess.Popen([str(target)], cwd=str(target.parent),
+                                          creationflags=flags, stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL)
+        for _ in range(90):
+            if comfy_reachable():
+                log("ComfyUI запущен в фоне")
+                return {"ok": True, "message": "ComfyUI запущен в фоне"}
+            if _COMFY_PROCESS.poll() is not None:
+                break
+            time.sleep(2)
+        return {"ok": False, "message": "ComfyUI не ответил за 3 минуты; проверьте путь и журнал ComfyUI"}
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+
+@app.post("/api/comfy_start")
+async def comfy_start():
+    return await asyncio.to_thread(ensure_comfy_background)
 
 @app.get("/api/comfy_status")
 def comfy_status():
@@ -942,6 +1084,73 @@ def comfy_status():
         return {"ok": bool(models), "models": models, "message": "Готов к генерации" if models else "Не установлены модели"}
     except Exception as exc:
         return {"ok": False, "models": [], "message": str(exc)}
+
+@app.post("/api/video_workflow")
+def save_video_workflow(body: dict):
+    raw=body.get("text", "")
+    if len(raw)>4_000_000: raise HTTPException(413,"Граф слишком большой")
+    try:
+        graph=json.loads(raw)
+        if "prompt" in graph and isinstance(graph["prompt"],dict):graph=graph["prompt"]
+        if not isinstance(graph,dict) or not any(isinstance(x,dict) and "class_type" in x for x in graph.values()):
+            raise ValueError("Это не API Format JSON")
+    except Exception as exc: raise HTTPException(400,str(exc))
+    Path("video_workflow_api.json").write_text(raw,"utf-8")
+    return {"ok":True,"nodes":len(graph)}
+
+@app.get("/api/video_workflow_status")
+def video_workflow_status():
+    try:
+        graph=video_workflow_graph()
+        return {"ok":True,"nodes":len(graph)}
+    except Exception as exc:return {"ok":False,"message":str(exc)}
+
+@app.post("/api/hr/hire")
+def hr_hire(body:dict):
+    name=str(body.get("name","")).strip()[:60]
+    task=str(body.get("task","")).strip()[:3000]
+    if not name or not task: raise HTTPException(400,"Укажите имя агента и его обязанности")
+    if len(q("select id from hired_agents"))>=12:raise HTTPException(400,"Максимум 12 дополнительных агентов")
+    q("insert into hired_agents(name,task) values(?,?)",name,task)
+    log(f"HR: нанят агент «{name}»")
+    return {"ok":True}
+
+@app.post("/api/hr/task/{agent_id}")
+def hr_task(agent_id:int,body:dict):
+    rows=q("select * from hired_agents where id=?",agent_id)
+    if not rows:raise HTTPException(404,"Агент не найден")
+    if rows[0]["status"]=="working":raise HTTPException(409,"Агент уже работает")
+    assignment=str(body.get("assignment","")).strip()[:3000]
+    if not assignment:raise HTTPException(400,"Укажите задачу")
+    q("update hired_agents set status='queued',result=? where id=?",assignment,agent_id)
+    return {"ok":True}
+
+@app.post("/api/hr/remove/{agent_id}")
+def hr_remove(agent_id:int):
+    rows=q("select status from hired_agents where id=?",agent_id)
+    if not rows:raise HTTPException(404,"Агент не найден")
+    if rows[0]["status"]=="working":raise HTTPException(409,"Нельзя уволить работающего агента")
+    q("delete from hired_agents where id=?",agent_id)
+    return {"ok":True}
+
+async def hired_agent_loop():
+    while True:
+        queued=q("select * from hired_agents where status='queued' order by id limit 1")
+        if not queued or not KEY:
+            await asyncio.sleep(3);continue
+        a=queued[0]
+        q("update hired_agents set status='working' where id=?",a["id"])
+        try:
+            assignment=a["result"]
+            def run_task():
+                response=Anthropic(api_key=KEY).messages.create(model=MODEL,max_tokens=2500,messages=[{"role":"user","content":f"Ты агент {a['name']}. Твои обязанности: {a['task']}.\nТекущая задача: {assignment}\nДай полезный текстовый результат. Не утверждай, что выполнил действия в приложениях или файлах: инструментов для этого у тебя нет."}])
+                return "\n".join(x.text for x in response.content if x.type=="text")
+            result=await asyncio.to_thread(run_task)
+            q("update hired_agents set status='done',result=? where id=?",result,a["id"])
+            log(f"Агент {a['name']}: задача выполнена")
+        except Exception as exc:
+            q("update hired_agents set status='error',result=? where id=?",str(exc),a["id"])
+        await asyncio.sleep(1)
 
 @app.post("/api/client_secret")
 def client_secret(body: dict):

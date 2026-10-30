@@ -28,11 +28,34 @@ button{font:inherit;border:0;border-radius:8px;padding:7px 14px;cursor:pointer;c
 .empty{color:var(--mut);font-size:13px}
 label{display:block;font-size:13px;color:var(--mut);margin-bottom:8px}input,select{display:block;width:100%;padding:6px;margin-top:3px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--tx);font:inherit}
 textarea{display:block;width:100%;min-height:54px;margin:0 0 8px;padding:6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--tx);font:inherit;font-size:13px}.e{background:var(--acc)}
+
+/* Pixel office: вид сверху, без сторонних ассетов */
+.office-world{position:relative;height:620px;overflow:hidden;border:7px solid #453b57;border-radius:14px;background:#b3bca9;box-shadow:inset 0 0 0 5px #cfd5bc;margin-bottom:5px}
+.office-floor{position:absolute;inset:0;background:repeating-linear-gradient(0deg,transparent 0 38px,#a4ae9d 39px 40px),repeating-linear-gradient(90deg,transparent 0 38px,#a4ae9d 39px 40px);image-rendering:pixelated}
+.office-hint{font-size:12px;color:var(--mut);margin-bottom:15px}
+.pixel-desk{position:absolute;width:146px;height:130px;transform:translate(-50%,-50%);cursor:pointer;border:0;background:none;color:#27213a;padding:0;margin:0;text-align:center;z-index:2}
+.pixel-table{position:absolute;top:18px;left:8px;width:130px;height:67px;background:#b77955;border:6px solid #79523e;box-shadow:0 9px 0 #5b4052,8px 10px 0 #83706a}
+.pixel-monitor{position:absolute;top:5px;left:49px;width:46px;height:32px;background:#302c42;border:5px solid #51475e;box-shadow:0 5px 0 #3a3446}
+.pixel-monitor:after{content:'';position:absolute;inset:4px;background:#69b4b7}
+.pixel-avatar{position:absolute;top:70px;left:56px;font-size:38px;filter:drop-shadow(3px 4px 0 #65586a);animation:pixel-idle 1.2s steps(2) infinite}
+.pixel-desk.working .pixel-avatar{animation:pixel-work .35s steps(2) infinite}
+.pixel-desk.idle .pixel-avatar{animation:pixel-wander 5s steps(12) infinite alternate}
+.pixel-desk.paused .pixel-avatar{animation:none;opacity:.65}
+.pixel-label{position:absolute;top:111px;left:0;width:100%;background:#292338;color:white;padding:3px 2px;border:2px solid #665774;font-size:12px;font-weight:700}
+.pixel-bubble{position:absolute;top:-22px;left:75px;background:#fff4b7;border:3px solid #554763;border-radius:2px;min-width:32px;padding:3px;color:#292338;font-size:12px;z-index:4}
+.pixel-decor{position:absolute;font-size:33px;opacity:.85;pointer-events:none}
+@keyframes pixel-idle{to{transform:translateY(3px)}}@keyframes pixel-work{to{transform:translateY(4px)}}@keyframes pixel-wander{0%{transform:translate(0,0)}25%{transform:translate(-30px,20px)}55%{transform:translate(24px,35px)}80%{transform:translate(40px,-4px)}100%{transform:translate(0,0)}}
+.office-modal[hidden]{display:none}.office-modal{position:fixed;inset:0;background:#100c19b9;z-index:99;display:flex;align-items:center;justify-content:center;padding:20px}
+.office-computer{width:min(680px,95vw);max-height:85vh;overflow:auto;background:var(--card);color:var(--tx);border:9px solid #595068;box-shadow:12px 12px 0 #221b2f;padding:20px;position:relative}
+.office-close{float:right;background:#a94455}.office-computer .req{margin-top:10px}
+@media(max-width:700px){.office-world{height:530px}.pixel-desk{width:120px}.pixel-table{width:110px}.pixel-label{font-size:10px}}
 </style>
 </head>
 <body>
 <h1>🏢 AI-офис Shorts</h1>
-<div class="office" id="office"></div>
+<div class="office-world" id="office"><div class="office-floor" id="officeFloor"></div></div>
+<div class="office-hint">Нажми на сотрудника, чтобы открыть его компьютер. Свободные агенты гуляют по офису.</div>
+<div class="office-modal" id="agentModal" hidden><div class="office-computer"><button class="office-close" onclick="closeAgent()">✕</button><div id="agentPanel"></div></div></div>
 <div class="cols">
  <div class="card"><h2>Нужно ваше решение</h2><div id="reqs"></div></div>
  <div class="card"><h2>Статистика канала</h2><div id="vids"></div></div>
@@ -52,9 +75,15 @@ textarea{display:block;width:100%;min-height:54px;margin:0 0 8px;padding:6px;bor
   <label>Правила сценариста (действуют всегда)<textarea id="s_wr" style="min-height:90px" placeholder="Например: не больше 25 секунд; начинай с вопроса; не используй слово «шокирующий»"></textarea></label>
   <label>Правила монтажёра (действуют всегда)<textarea id="s_er" style="min-height:90px" placeholder="Например: яркие цвета; персонажи без оружия; всегда добавляй солнце на небо"></textarea></label>
   <label>Правила аналитика<textarea id="s_ar" style="min-height:80px" placeholder="Какие темы и показатели учитывать"></textarea></label>
-  <label>Визуальный движок<select id="s_visual"><option value="comfy_layers">Раздельные фон и персонаж (экспериментальный)</option><option value="comfy">AI-иллюстрации через ComfyUI (рекомендуется)</option><option value="auto">Автоматический (изображения или резервная графика)</option><option value="illustrations">Только изображения из папки visuals</option><option value="legacy">Старый генератор фигур (Claude API)</option></select></label>
+  <label>Визуальный движок<select id="s_visual"><option value="comfy_video">Локальная генерация ВИДЕО через ComfyUI (Pika H3 Flex)</option><option value="comfy_layers">Раздельные фон и персонаж (экспериментальный)</option><option value="comfy">AI-иллюстрации через ComfyUI (рекомендуется)</option><option value="auto">Автоматический (изображения или резервная графика)</option><option value="illustrations">Только изображения из папки visuals</option><option value="legacy">Старый генератор фигур (Claude API)</option></select></label>
   <p class="empty">Автоматический режим использует изображения из visuals, если они есть; иначе временно рисует сцены встроенным движком. Режим ComfyUI генерирует изображения автоматически на вашей видеокарте. Для работы требуется установленный и запущенный ComfyUI с моделью SD 1.5 или SDXL. При ошибке сценарий сохраняется.</p>
+  <label><input type="checkbox" id="s_autostart" style="display:inline;width:auto"> Автоматически запускать ComfyUI в фоне</label>
+  <label>Путь к файлу запуска ComfyUI (.bat/.exe)<input id="s_launch" placeholder="C:\\ComfyUI\\run_nvidia_gpu.bat"></label>
+  <button type="button" class="e" onclick="startComfy()">Запустить ComfyUI в фоне</button><span id="comfy_launch_st"></span>
   <label>Адрес локального ComfyUI<input id="s_comfy" placeholder="http://127.0.0.1:8188"></label>
+  <label>API JSON рабочего графа Pika H3 Flex (экспорт API Format)<input type="file" id="s_workflow_file" accept=".json" onchange="uploadWorkflow()"></label><span id="workflow_status" class="empty"></span>
+  <label>ID узла промпта в API JSON (если автоопределение не сработает)<input id="s_prompt_node" placeholder="Например 12"></label>
+  <label>Имя поля промпта<input id="s_prompt_field" placeholder="prompt"></label>
   <label>Имя модели ComfyUI (оставьте пустым для первой доступной)<input id="s_ckpt" placeholder="например dreamshaper_8.safetensors"></label>
   <label>Шагов генерации (8–40)<input id="s_steps" type="number" min="8" max="40"></label>
   <button class="e" type="button" onclick="checkComfy()">Проверить генератор изображений</button><span id="comfy_st"></span>
@@ -70,18 +99,53 @@ textarea{display:block;width:100%;min-height:54px;margin:0 0 8px;padding:6px;bor
  </div>
 </div>
 <script>
-const A={writer:["Агент 1","Сценарист","🧑‍💻","📝"],editor:["Агент 2","Монтажёр","🎬","🎞️"],analyst:["Агент 3","Аналитик","📊","📈"]};
+const A={hr:["HR","HR-менеджер","🧑‍💼","📋"],writer:["Агент 1","Сценарист","🧑‍💻","📝"],editor:["Агент 2","Монтажёр","🎬","🎞️"],analyst:["Агент 3","Аналитик","📊","📈"]};
 const L={idle:"Свободен",working:"Работает",waiting:"Ждёт вас"};
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 let sig="";
+let officeData=null,activeAgent=null;
+function openAgent(k){activeAgent=k;$("agentModal").hidden=false;renderAgentPanel()}
+function closeAgent(){activeAgent=null;$("agentModal").hidden=true}
+async function toggleWriter(){if(!officeData)return;await post("/api/writer_pause",{paused:!officeData.writer_paused});await tick();renderAgentPanel()}
+async function hireAgent(){const r=await post('/api/hr/hire',{name:$('hire_name').value,task:$('hire_task').value});if(!r.ok)alert(r.detail||'Ошибка');await tick();renderAgentPanel()}
+async function assignAgent(id){const r=await post('/api/hr/task/'+id,{assignment:$('custom_task').value});if(!r.ok)alert(r.detail||'Ошибка');await tick()}
+async function removeAgent(id){if(!confirm('Уволить агента?'))return;const r=await post('/api/hr/remove/'+id,{});if(!r.ok)alert(r.detail||'Ошибка');else closeAgent();await tick()}
+async function uploadWorkflow(){const f=$('s_workflow_file').files[0];if(!f)return;const r=await post('/api/video_workflow',{text:await f.text()});$('workflow_status').textContent=r.ok?'✓ Загружен API граф: '+r.nodes+' узлов':'Ошибка: '+(r.detail||'Неверный формат')}
+function renderAgentPanel(){
+ if(!officeData||!activeAgent)return;
+ const k=activeAgent,a=A[k],s=officeData.agents[k]||{s:"idle",t:"Управление персоналом"};
+ if(k==='hr'){
+  $('agentPanel').innerHTML=`<h2>🧑‍💼 HR-менеджер</h2><p>Нанимает текстовых AI-агентов с заданными обязанностями. Для внешних действий потребуются отдельные интеграции.</p><label>Имя нового агента<input id="hire_name" placeholder="Например: исследователь"></label><label>Обязанности<textarea id="hire_task" placeholder="Что должен делать агент"></textarea></label><button class="y" onclick="hireAgent()">Нанять агента</button>`;return;
+ }
+ if(k.startsWith('custom_')){
+  const id=+k.split('_')[1], agent=officeData.hired.find(a=>a.id===id);
+  if(!agent)return;
+  $('agentPanel').innerHTML=`<h2>🖥️ ${esc(agent.name)}</h2><p>${esc(agent.task)}</p><p>Статус: ${esc(agent.status)}</p><label>Новая задача<textarea id="custom_task" placeholder="Поручение агенту"></textarea></label><button class="y" onclick="assignAgent(${id})">Дать задачу</button><button class="n" onclick="removeAgent(${id})">Уволить</button><h3>Результат</h3><pre style="white-space:pre-wrap">${esc(agent.result||'Пока нет результата')}</pre>`;return;
+ }
+ const pending=officeData.pending.filter(r=>k==='writer'?r.kind==='script_pending':k==='editor'?(r.kind==='video_pending'||r.kind==='render_failed'):false);
+ $("agentPanel").innerHTML=`<h2>🖥️ Компьютер: ${a[1]}</h2><p>${esc(s.t)}</p>`+
+ (k==='writer'?`<button class="${officeData.writer_paused?'y':'n'}" onclick="toggleWriter()">${officeData.writer_paused?'▶ Возобновить написание':'⏸ Приостановить написание'}</button><p class="empty">Пауза запрещает начинать новые сценарии и правки после завершения текущего запроса.</p>`:'')+
+ (k==='analyst'?`<h3>Статистика</h3>${officeData.videos.map(v=>`<p>${esc(v.title)} — ${v.views} просмотров</p>`).join('')||'Опубликованных видео пока нет.'}`:'')+
+ (pending.length?pending.map(r=>`<div class="req"><b>${esc(r.title)}</b><p>${esc(r.text)}</p>${r.kind==='video_pending'?`<video src="/media/${r.id}" controls></video>`:''}${r.kind==='render_failed'?`<p>${esc(r.error)}</p><button class="y" onclick="retryRender(${r.id})">Повторить</button><button class="n" onclick="deleteFailed(${r.id})">Удалить</button>`:`<textarea id="n${r.id}" placeholder="Напишите правки"></textarea><button class="y" onclick="decide(${r.id},true)">Одобрить</button><button class="e" onclick="revise(${r.id})">Доработать</button><button class="n" onclick="decide(${r.id},false)">Отклонить</button>`}</div>`).join(''):'<p class="empty">Нет заданий, требующих решения.</p>');
+}
 async function tick(){
  try{
   const d=await (await fetch("/api/state")).json();
-  $("office").innerHTML=Object.keys(A).map(k=>{const a=A[k],s=d.agents[k];
-   return `<div class="desk ${s.s}"><div class="role">${a[0]}</div><div class="name">${a[1]}</div>
-   <div class="stage"><span class="av">${a[2]}</span><span class="mon">${a[3]}</span></div>
-   <div class="st">${L[s.s]}</div><div class="task">${esc(s.t)}</div></div>`}).join("");
+  officeData=d;
+  const agents=[...Object.keys(A),...d.hired.map(a=>'custom_'+a.id)];
+  const positions=agents.map((k,j)=>[14+(j%4)*24,18+Math.floor(j/4)*29]);
+  const countDesk=Math.max(12,Math.ceil(agents.length/4)*4);
+  $('officeFloor').innerHTML='<span class="pixel-decor" style="top:87%;left:5%">🪴</span><span class="pixel-decor" style="top:87%;left:90%">🪴</span>'+Array.from({length:countDesk},(_,j)=>{
+   const k=agents[j],p=[14+(j%4)*24,18+Math.floor(j/4)*29];
+   if(!k)return `<div class="pixel-desk empty-desk" style="left:${p[0]}%;top:${p[1]}%;pointer-events:none;opacity:.45"><span class="pixel-table"></span><span class="pixel-monitor"></span><span class="pixel-label">Свободное место</span></div>`;
+   const custom=k.startsWith('custom_'),a=custom?d.hired.find(x=>x.id===+k.split('_')[1]):null;
+   const status=custom?(a.status==='queued'?'waiting':a.status==='working'?'working':'idle'):(k==='writer'&&d.writer_paused?'paused':d.agents[k]?.s||'idle');
+   const name=custom?a.name:A[k][1];
+   const count=k==='writer'?d.pending.filter(r=>r.kind==='script_pending').length:k==='editor'?d.pending.filter(r=>['video_pending','render_failed'].includes(r.kind)).length:0;
+   return `<button class="pixel-desk ${status}" style="left:${p[0]}%;top:${p[1]}%" onclick="openAgent('${k}')"><span class="pixel-table"></span><span class="pixel-monitor"></span><span class="pixel-avatar">${k==='hr'?'🧑‍💼':custom?'🧑‍💻':k==='writer'?'🧑🏻‍💻':k==='editor'?'🧑🏽‍💻':'👩🏽‍💻'}</span><span class="pixel-label">${esc(name)} · ${status==='working'?'Работает':status==='paused'?'Пауза':custom?esc(a.status):'Свободен'}</span>${count?`<span class="pixel-bubble">❗${count}</span>`:status==='working'?'<span class="pixel-bubble">💬</span>':''}</button>`;
+  }).join('');
+  if(activeAgent) renderAgentPanel();
   const rs=JSON.stringify(d.pending);
   if(rs!==sig){sig=rs;
    $("reqs").innerHTML=d.pending.length?d.pending.map(r=>`<div class="req"><b>${r.kind==="script_pending"?"Сценарий":r.kind==="render_failed"?"Ошибка монтажа — сценарий сохранён":"Опубликовать видео?"}: ${esc(r.title)}</b>
@@ -103,15 +167,16 @@ async function revise(id){const t=$("n"+id).value.trim();if(!t){alert("Напи�
 function testVoice(){const a=new Audio("/api/voice_test?voice="+encodeURIComponent($("s_voice").value));a.onerror=()=>alert("Этот голос сейчас недоступен. Выберите другой.");a.play().catch(()=>{})}
 async function decide(id,ok){await fetch("/api/decide",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,ok})});sig="";tick()}
 async function loadSet(){const s=await (await fetch("/api/settings")).json();
- $("s_niche").value=s.niche;$("s_wr").value=s.writer_rules||"";$("s_er").value=s.editor_rules||"";$("s_ar").value=s.analyst_rules||"";$("s_visual").value=s.visual_mode||"auto";$("s_comfy").value=s.comfy_url||"http://127.0.0.1:8188";$("s_ckpt").value=s.comfy_checkpoint||"";$("s_steps").value=s.image_steps||2;$("s_lang").value=s.lang;if(![...$("s_voice").options].some(o=>o.value===s.voice))$("s_voice").add(new Option(s.voice,s.voice));$("s_voice").value=s.voice;$("s_privacy").value=s.privacy;$("s_hit").value=s.hit_views;
+ $("s_prompt_node").value=s.video_prompt_node||"";$("s_prompt_field").value=s.video_prompt_field||"prompt";$("s_niche").value=s.niche;$("s_wr").value=s.writer_rules||"";$("s_er").value=s.editor_rules||"";$("s_ar").value=s.analyst_rules||"";$("s_visual").value=s.visual_mode||"auto";$("s_autostart").checked=!!s.comfy_autostart;$("s_launch").value=s.comfy_launch_command||"";$("s_comfy").value=s.comfy_url||"http://127.0.0.1:8188";$("s_ckpt").value=s.comfy_checkpoint||"";$("s_steps").value=s.image_steps||2;$("s_lang").value=s.lang;if(![...$("s_voice").options].some(o=>o.value===s.voice))$("s_voice").add(new Option(s.voice,s.voice));$("s_voice").value=s.voice;$("s_privacy").value=s.privacy;$("s_hit").value=s.hit_views;
  $("k").textContent=s.has_key?"✅":"❌";$("c").textContent=s.has_client?"✅":"❌";$("t").textContent=s.has_token?"✅ подключён":"❌ не подключён"}
 async function post(u,b){return (await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})).json()}
+async function startComfy(){const el=$("comfy_launch_st");el.textContent=" Запуск…";const r=await post("/api/comfy_start",{});el.textContent=" "+r.message}
 async function checkComfy(){
  const el=$("comfy_st");el.textContent=" Проверка…";
  const r=await (await fetch("/api/comfy_status")).json();
  el.textContent=r.ok?" ✓ "+r.models.length+" модель(ей): "+r.models.slice(0,2).join(", "):" ✗ "+r.message;
 }
-async function save(){await post("/api/settings",{api_key:$("s_key").value,niche:$("s_niche").value,writer_rules:$("s_wr").value,editor_rules:$("s_er").value,analyst_rules:$("s_ar").value,visual_mode:$("s_visual").value,comfy_url:$("s_comfy").value,comfy_checkpoint:$("s_ckpt").value,image_steps:+$("s_steps").value||2,motion:"dynamic",lang:$("s_lang").value,voice:$("s_voice").value,privacy:$("s_privacy").value,hit_views:+$("s_hit").value||1000});$("s_key").value="";loadSet();alert("Сохранено")}
+async function save(){await post("/api/settings",{api_key:$("s_key").value,niche:$("s_niche").value,writer_rules:$("s_wr").value,editor_rules:$("s_er").value,analyst_rules:$("s_ar").value,visual_mode:$("s_visual").value,comfy_url:$("s_comfy").value,comfy_autostart:$("s_autostart").checked,comfy_launch_command:$("s_launch").value,video_prompt_node:$("s_prompt_node").value,video_prompt_field:$("s_prompt_field").value,comfy_checkpoint:$("s_ckpt").value,image_steps:+$("s_steps").value||2,motion:"dynamic",lang:$("s_lang").value,voice:$("s_voice").value,privacy:$("s_privacy").value,hit_views:+$("s_hit").value||1000});$("s_key").value="";loadSet();alert("Сохранено")}
 $("s_file").onchange=async e=>{const f=e.target.files[0];if(!f)return;const r=await post("/api/client_secret",{text:await f.text()});alert(r.ok?"Файл загружен":"Не удалось прочитать файл");loadSet()}
 async function yt(){const r=await post("/api/youtube_auth",{});alert(r.ok?"YouTube подключён":"Ошибка: "+r.error);loadSet()}
 async function loadChars(sel){const d=await (await fetch("/api/characters")).json();const el=$("c_sel");
