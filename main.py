@@ -1,5 +1,5 @@
 """AI-офис для YouTube Shorts: сценарист -> (вы) -> монтажёр/публикатор -> (вы) -> аналитик -> сценарист."""
-import asyncio, base64, glob, json, math, os, random, re, sqlite3, subprocess, sys, threading, time, urllib.request, urllib.parse, uuid
+import asyncio, base64, glob, json, math, os, random, re, sqlite3, subprocess, sys, threading, time, urllib.request, urllib.parse, urllib.error, uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -218,7 +218,12 @@ def qwen_tts_sync(text, path, voice=None):
     node["inputs"]["speaker"] = voice or CFG.get("voice") or "Ryan"
     node["inputs"]["seed"] = random.randrange(1, 2**48)
     # 0.6B was the model confirmed working earlier; selectable via config later.
-    node["inputs"]["model_choice"] = CFG.get("qwen_model", "0.6B")
+    # Preserve the model used in the successfully exported workflow.
+    # A saved legacy setting (often 0.6B) must not silently replace it.
+    workflow_model = node["inputs"].get("model_choice")
+    selected_model = CFG.get("qwen_model")
+    if selected_model and selected_model != workflow_model:
+        log(f"Qwen3-TTS: модель из рабочего workflow ({workflow_model}) сохранена; настройка {selected_model} не применяется")
     node["inputs"]["unload_model_after_generate"] = True
     save_nodes = [n for n in graph.values() if n.get("class_type") == "SaveAudioAdvanced"]
     if not save_nodes:
@@ -562,8 +567,18 @@ def comfy_json(url, endpoint, payload=None, timeout=15):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url.rstrip("/") + endpoint, data=data,
         headers={"Content-Type": "application/json"} if data else {}, method="POST" if data else "GET")
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        # ComfyUI includes precise invalid node/input details in the response body.
+        details = exc.read().decode("utf-8", "replace")
+        try:
+            parsed = json.loads(details)
+            details = json.dumps(parsed, ensure_ascii=False)
+        except (ValueError, TypeError):
+            pass
+        raise RuntimeError(f"ComfyUI {endpoint}: HTTP {exc.code}: {details[:3500]}") from exc
 
 
 def comfy_checkpoints(url):

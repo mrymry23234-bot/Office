@@ -93,7 +93,7 @@ textarea{display:block;width:100%;min-height:54px;margin:0 0 8px;padding:6px;bor
   <button class="e" type="button" onclick="checkComfy()">Проверить генератор изображений</button><span id="comfy_st"></span>
   <label>Язык сценариев<input id="s_lang"></label>
   <label>Движок озвучки<select id="s_voice_engine" onchange="changeVoiceEngine()"><option value="comfy_qwen">Qwen3-TTS (через ComfyUI)</option><option value="piper">Piper (отдельно)</option></select></label>
-  <label>Модель Qwen3-TTS<select id="s_qwen_model"><option value="0.6B">0.6B — меньше нагрузка</option><option value="1.7B">1.7B — выше качество, больше нагрузка</option></select></label>
+  <label>Модель Qwen3-TTS (для озвучки используется модель из voice_workflow_api.json)<select id="s_qwen_model"><option value="0.6B">0.6B — меньше нагрузка</option><option value="1.7B">1.7B — выше качество, больше нагрузка</option></select></label>
   <label>Путь к Piper TTS (piper.exe)<input id="s_piper" placeholder="C:\\Piper\\piper.exe"></label>
   <label>Папка с голосовыми моделями (.onnx и .onnx.json)<input id="s_models" placeholder="voices"></label>
   <label>Локальный голос<select id="s_voice"></select></label>
