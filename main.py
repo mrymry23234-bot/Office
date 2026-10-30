@@ -203,9 +203,12 @@ QWEN_SPEAKERS = ("Ryan", "Aiden", "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric
 def qwen_tts_sync(text, path, voice=None):
     import copy
     import imageio_ffmpeg
-    graph_path = BASE / "voice_workflow_api.json"
-    if not graph_path.is_file():
-        raise RuntimeError("Не найден voice_workflow_api.json рядом с программой")
+    # Prefer an editable workflow next to the executable; fall back to bundled data.
+    app_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    candidates = [app_dir / "voice_workflow_api.json", BASE / "voice_workflow_api.json"]
+    graph_path = next((p for p in candidates if p.is_file()), None)
+    if graph_path is None:
+        raise RuntimeError("Не найден voice_workflow_api.json. Проверены пути: " + "; ".join(str(p) for p in candidates))
     graph = copy.deepcopy(json.loads(graph_path.read_text("utf-8")))
     nodes = [(nid, node) for nid, node in graph.items() if node.get("class_type") == "FB_Qwen3TTSCustomVoice"]
     if len(nodes) != 1:
